@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 import SwiftUI
 
 /// Determines how CodeMap definitions are inserted.

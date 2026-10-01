@@ -7,12 +7,13 @@
 //
 
 import AppKit
+import RepoPromptInstrumentation
 import SwiftUI
 import UniformTypeIdentifiers
 
 struct AgentComposerActions {
-    let storeDraft: (_ tabID: UUID, _ text: String) -> Void
-    let retrieveDraft: (_ tabID: UUID) -> String
+    let storeDraft: (_ tabID: UUID, _ text: String, _ acknowledgedSequence: UInt64) -> Void
+    let loadDraft: (_ tabID: UUID) -> AgentComposerDraftSnapshot
     let claimSubmit: (_ attempt: AgentComposerSubmitAttempt) -> AgentModeViewModel.AgentComposerSubmitClaimResult
     let executeSubmit: (_ claim: AgentModeViewModel.AgentComposerSubmitClaim, _ text: String) async -> AgentModeViewModel.UserTurnSubmissionResult
     let cancelRun: (_ target: AgentRunCancelTarget) async -> Void
@@ -38,6 +39,7 @@ struct AgentComposerActions {
 }
 
 struct AgentInputBar: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let agentModeVM: AgentModeViewModel
     @ObservedObject var composerUI: AgentComposerUIStore
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
@@ -83,7 +85,7 @@ struct AgentInputBar: View {
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.inputBar")
+            let _ = perfRecorder.increment("ui.body.inputBar")
         #endif
         AgentComposerView(
             props: composerUI.props,
@@ -108,8 +110,10 @@ struct AgentInputBar: View {
 
     private var composerActions: AgentComposerActions {
         AgentComposerActions(
-            storeDraft: { tabID, text in agentModeVM.storeDraftText(for: tabID, text) },
-            retrieveDraft: { tabID in agentModeVM.retrieveDraftText(for: tabID) },
+            storeDraft: { tabID, text, sequence in
+                agentModeVM.storeDraftText(for: tabID, text, acknowledgingThrough: sequence)
+            },
+            loadDraft: { tabID in agentModeVM.loadDraftSnapshotForComposer(for: tabID) },
             claimSubmit: { attempt in agentModeVM.claimComposerSubmitAttempt(attempt) },
             executeSubmit: { claim, text in
                 await agentModeVM.executeComposerSubmitAttempt(text: text, claim: claim)
@@ -166,7 +170,7 @@ struct AgentInputBar: View {
     @ViewBuilder
     private var statusPills: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.inputBar.statusPills")
+            let _ = perfRecorder.increment("ui.body.inputBar.statusPills")
         #endif
         AgentStatusPillsRow(
             agentModeVM: agentModeVM,
@@ -244,6 +248,7 @@ enum AgentFileMentionText {
 }
 
 struct AgentComposerView: View, Equatable {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let props: AgentComposerProps
     let placeholderText: String
     let actions: AgentComposerActions
@@ -262,7 +267,7 @@ struct AgentComposerView: View, Equatable {
     @State private var localInputText: String = ""
     @State private var externalTextUpdateTick: Int = 0
     @State private var submissionLatch = AgentComposerSubmissionLatch()
-    @State private var lastAppliedDraftRestorationEventIDByTab: [UUID: UUID] = [:]
+    @State private var acknowledgedDraftRestorationSequenceByTab: [UUID: UInt64] = [:]
     @State private var editorTextFieldHeight: CGFloat = ResizableTextField.height(forPresetIndex: 0, preset: .normal)
     @State private var isInputEmpty: Bool = true
     @State private var chromeOcclusion: CGFloat = 0
@@ -451,7 +456,7 @@ struct AgentComposerView: View, Equatable {
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.composer")
+            let _ = perfRecorder.increment("ui.body.composer")
         #endif
         VStack(spacing: 0) {
             ComposerChrome(
@@ -490,7 +495,7 @@ struct AgentComposerView: View, Equatable {
         .onDisappear {
             // Store draft when leaving
             if let tabID = currentTabID {
-                actions.storeDraft(tabID, localInputText)
+                actions.storeDraft(tabID, localInputText, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
             }
             steeringUnsupportedDismissTask?.cancel()
             steeringUnsupportedDismissTask = nil
@@ -501,7 +506,7 @@ struct AgentComposerView: View, Equatable {
         .onChange(of: currentTabID) { oldTabID, newTabID in
             // Switch drafts when tab changes
             if let oldTabID {
-                actions.storeDraft(oldTabID, localInputText)
+                actions.storeDraft(oldTabID, localInputText, acknowledgedDraftRestorationSequenceByTab[oldTabID] ?? 0)
             }
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
@@ -510,7 +515,7 @@ struct AgentComposerView: View, Equatable {
         .onChange(of: localInputText) { _, newValue in
             isInputEmpty = newValue.isEmpty
             guard let tabID = currentTabID, !isSyncingDraftFromSession else { return }
-            actions.storeDraft(tabID, newValue)
+            actions.storeDraft(tabID, newValue, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
         }
         .onChange(of: props.draftRestorationEvent) { _, event in
             guard let event, event.tabID == currentTabID else { return }
@@ -536,15 +541,19 @@ struct AgentComposerView: View, Equatable {
                     restoredText = AgentComposerDraftRestorationReducer.apply(
                         operation,
                         to: localInputText,
-                        lastAppliedRestorationEventID: lastAppliedDraftRestorationEventIDByTab[event.tabID]
+                        acknowledgedSequence: acknowledgedDraftRestorationSequenceByTab[event.tabID] ?? 0
                     )
                 } else {
                     restoredText = event.text
                 }
             }
-            lastAppliedDraftRestorationEventIDByTab[event.tabID] = event.id
+            let sequence = max(
+                acknowledgedDraftRestorationSequenceByTab[event.tabID] ?? 0,
+                event.operation?.fragments.last?.sequence ?? 0
+            )
+            acknowledgedDraftRestorationSequenceByTab[event.tabID] = sequence
             setLocalInputText(restoredText, forceRevision: true, isExternalUpdate: true)
-            actions.storeDraft(event.tabID, restoredText)
+            actions.storeDraft(event.tabID, restoredText, sequence)
             DispatchQueue.main.async {
                 isSyncingDraftFromSession = false
             }
@@ -914,6 +923,16 @@ struct AgentComposerView: View, Equatable {
             return [.action("Use \(agent.displayName)", isEnabled: true, imageSystemName: agent.iconName) {
                 actions.selectAgentModel(agent, "")
             }]
+        }
+        if agent == .devin {
+            return DevinModelCatalog.current.menuGroups(for: options).flatMap { group -> [StableMenuItem] in
+                guard group.rendersAsSubmenu else {
+                    return group.entries.map { inputBarModelMenuItem(agent: agent, model: $0.option) }
+                }
+                return [.submenu(group.displayName, items: group.entries.map {
+                    inputBarModelMenuItem(agent: agent, model: $0.option, title: $0.effortDisplayName)
+                })]
+            }
         }
         guard agent == .openCode else {
             return options.map { inputBarModelMenuItem(agent: agent, model: $0) }
@@ -1568,7 +1587,11 @@ struct AgentComposerView: View, Equatable {
             return
         }
 
-        actions.storeDraft(attempt.sourceTabID, rawDraftSnapshot)
+        actions.storeDraft(
+            attempt.sourceTabID,
+            rawDraftSnapshot,
+            acknowledgedDraftRestorationSequenceByTab[attempt.sourceTabID] ?? 0
+        )
         switch actions.claimSubmit(attempt) {
         case let .claimed(claim):
             Task { @MainActor in
@@ -1625,19 +1648,19 @@ struct AgentComposerView: View, Equatable {
 
     private func logViewSubmitRejection(reason: String, target: AgentComposerSubmitTarget?) {
         #if DEBUG
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "agent.composer.submit.rejected",
                 tabID: currentTabID,
                 fields: [
                     "reason": reason,
-                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
-                    "propsTabID": AgentModePerfDiagnostics.shortID(props.currentTabID),
-                    "targetTabID": AgentModePerfDiagnostics.shortID(target?.tabID),
-                    "attemptID": AgentModePerfDiagnostics.shortID(submissionLatch.activeAttemptID(for: currentTabID)),
+                    "currentTabID": perfRecorder.shortID(currentTabID),
+                    "propsTabID": perfRecorder.shortID(props.currentTabID),
+                    "targetTabID": perfRecorder.shortID(target?.tabID),
+                    "attemptID": perfRecorder.shortID(submissionLatch.activeAttemptID(for: currentTabID)),
                     "inputRevision": String(submissionLatch.inputRevision),
-                    "expectedSubmissionToken": AgentModePerfDiagnostics.shortID(target?.expectedSubmissionToken),
-                    "expectedSourceAgentSessionID": AgentModePerfDiagnostics.shortID(target?.expectedSourceAgentSessionID),
-                    "expectedPersistentBindingGeneration": AgentModePerfDiagnostics.shortID(target?.expectedPersistentBindingIdentity?.generation),
+                    "expectedSubmissionToken": perfRecorder.shortID(target?.expectedSubmissionToken),
+                    "expectedSourceAgentSessionID": perfRecorder.shortID(target?.expectedSourceAgentSessionID),
+                    "expectedPersistentBindingGeneration": perfRecorder.shortID(target?.expectedPersistentBindingIdentity?.generation),
                     "expectedBindingTransitionGeneration": target.map { String($0.expectedBindingTransitionGeneration) } ?? "nil"
                 ]
             )
@@ -1747,8 +1770,10 @@ struct AgentComposerView: View, Equatable {
 
     private func loadDraftFromSession(for tabID: UUID) {
         isSyncingDraftFromSession = true
+        let snapshot = actions.loadDraft(tabID)
+        acknowledgedDraftRestorationSequenceByTab[tabID] = snapshot.restorationSequence
         setLocalInputText(
-            actions.retrieveDraft(tabID),
+            snapshot.text,
             forceRevision: true,
             isExternalUpdate: true
         )

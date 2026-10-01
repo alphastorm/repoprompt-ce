@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcess
 
 struct ClaudeCodeCLIModelSelection: Equatable {
     let modelArgument: String?
@@ -64,9 +65,13 @@ final class ClaudeCodeProvider: AIProvider {
         "Edit",
         "Glob",
         "Grep",
+        "Agent",
         "Task",
         "TaskOutput",
         "TaskStop",
+        "Workflow",
+        "ListAgents",
+        "SendMessage",
         "WebFetch",
         "WebSearch",
         "SlashCommand",

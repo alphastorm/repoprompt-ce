@@ -1,5 +1,6 @@
 import AppKit
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 import SwiftUI
 
 /// Compact oversight pill, placed between Workflow and Interview.
@@ -8,6 +9,7 @@ import SwiftUI
 /// session-scoped and survives until explicit or lifecycle revocation, so the user needs a surface
 /// that lists both directions and offers Unlink at either end.
 struct AgentMonitorPill: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
     @State private var showPopover = false
 
@@ -22,7 +24,7 @@ struct AgentMonitorPill: View {
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.statusPills.monitor")
+            let _ = perfRecorder.increment("ui.body.statusPills.monitor")
         #endif
         let cornerRadius = AgentPillMetrics.cornerRadius()
         let height = AgentPillMetrics.height()
@@ -100,9 +102,6 @@ struct AgentMonitorPopoverView: View {
     /// Persistent validation text. Errors are never conveyed by transient colour alone.
     @State private var validationMessage: String?
     @State private var isWorking = false
-    /// Whether the next Add also grants management. Default off, and reset after every Add, so a
-    /// link is never managed unless the user asked for it on that link.
-    @State private var managesNewLink = false
     /// One busy gate per generation-qualified row. Navigation, acknowledgement, durable Unlink, and
     /// Auto-wake changes must not race from the same stale projection.
     ///
@@ -123,8 +122,6 @@ struct AgentMonitorPopoverView: View {
     /// outbound link at once, so gating it on a row would disable an unrelated row's actions.
     @State private var isChangingAutoWake = false
     @State private var autoWakeFailureMessage: String?
-    @State private var isChangingAutoApproval = false
-    @State private var autoApprovalFailureMessage: String?
     /// Local disclosure state for the pending-updates detail list. Presentation only: collapsing it
     /// acknowledges nothing, and reopening the popover starts collapsed again.
     @State private var showPendingUpdateDetails = false
@@ -252,15 +249,10 @@ struct AgentMonitorPopoverView: View {
 
                 Spacer(minLength: 0)
 
-                Toggle(AgentMonitorManagementCopy.addLabel, isOn: $managesNewLink)
-                    .toggleStyle(.checkbox)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                    .disabled(!props.canAdd || isWorking)
-                    .hoverTooltip(AgentMonitorManagementCopy.tooltip, .top)
-
                 Button("Oversee session") { submit() }
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
                     .disabled(!props.canAdd || preview == nil || isWorking)
+                    .hoverTooltip(AgentMonitorOversightDisclosure.boundary, .top)
             }
 
             if let reason = props.canAddReason {
@@ -368,9 +360,6 @@ struct AgentMonitorPopoverView: View {
                     .top
                 )
                 .accessibilityLabel(row.viewActionLabel)
-                if row.managementEnabled {
-                    managementBadge(AgentMonitorManagementCopy.badge, tooltip: AgentMonitorManagementCopy.tooltip)
-                }
                 if row.hasUnreadActivity {
                     unreadBadge(row, isBusy: isBusy)
                 }
@@ -392,27 +381,6 @@ struct AgentMonitorPopoverView: View {
                 Spacer(minLength: 6)
                 snoozeRow(row, now: now, isBusy: isBusy)
                     .layoutPriority(1)
-            }
-            // Management first: it decides what this overseer may do in the session at all.
-            HStack(spacing: 10) {
-                Toggle(AgentMonitorManagementCopy.laneLabel, isOn: Binding(
-                    get: { row.managementEnabled },
-                    set: { setLaneManagement(row, enabled: $0) }
-                ))
-                .toggleStyle(.checkbox)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
-                .disabled(isBusy)
-                .hoverTooltip(AgentMonitorManagementCopy.tooltip, .top)
-                .accessibilityLabel(AgentMonitorManagementCopy.accessibilityLabel(displayName: row.displayName))
-                Toggle(AgentMonitorAutoApprovalCopy.laneLabel, isOn: Binding(
-                    get: { row.autoApprovalEnabled },
-                    set: { setLaneAutoApproval(row, enabled: $0) }
-                ))
-                .toggleStyle(.checkbox)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                .disabled(isBusy || isChangingAutoApproval)
-                .hoverTooltip(AgentMonitorAutoApprovalCopy.tooltip, .top)
-                .accessibilityLabel("Auto-approve provider permissions for \(row.displayName)")
             }
             if let feedback = rowFeedbackByRowKey[row.rowKey] {
                 messageText(feedback.message)
@@ -574,22 +542,6 @@ struct AgentMonitorPopoverView: View {
                     .disabled(isChangingAutoWake || props.autoWakeUnavailableReason != nil)
                 }
             }
-            HStack(spacing: 8) {
-                Text(AgentMonitorAutoApprovalCopy.bulkLabel)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                    .hoverTooltip(AgentMonitorAutoApprovalCopy.tooltip, .top)
-                Button(
-                    currentOutboundLinksAreAllAutoApproved
-                        ? AgentMonitorAutoApprovalCopy.deselectAll
-                        : AgentMonitorAutoApprovalCopy.selectAll
-                ) {
-                    setAllCurrentAutoApproval(enabled: !currentOutboundLinksAreAllAutoApproved)
-                }
-                .buttonStyle(.plain)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                .foregroundStyle(Color.accentColor)
-                .disabled(isChangingAutoApproval)
-            }
             routineWakeIntervalRow(now: now)
             periodicIdleWakeRow
             if let reason = props.autoWakeUnavailableReason {
@@ -597,9 +549,6 @@ struct AgentMonitorPopoverView: View {
             }
             if let autoWakeFailureMessage {
                 messageText(autoWakeFailureMessage)
-            }
-            if let autoApprovalFailureMessage {
-                messageText(autoApprovalFailureMessage)
             }
         }
     }
@@ -609,10 +558,6 @@ struct AgentMonitorPopoverView: View {
     /// value the session had refused to take.
     private var currentOutboundTargetsAreAllSelected: Bool {
         props.outbound.allSatisfy { props.autoWakeTargetSessionIDs.contains($0.targetSessionID) }
-    }
-
-    private var currentOutboundLinksAreAllAutoApproved: Bool {
-        !props.outbound.isEmpty && props.outbound.allSatisfy(\.autoApprovalEnabled)
     }
 
     private func laneAutoWakeToggle(
@@ -836,12 +781,6 @@ struct AgentMonitorPopoverView: View {
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
-                    }
-                    if row.isManaging {
-                        managementBadge(
-                            AgentMonitorManagementCopy.inboundBadge,
-                            tooltip: AgentMonitorManagementCopy.inboundTooltip
-                        )
                     }
                     Spacer(minLength: 0)
                     // Either endpoint may revoke; both windows update from one authority transition.
@@ -1397,82 +1336,6 @@ struct AgentMonitorPopoverView: View {
         autoWakeFailureMessage = outcome.refusal?.message
     }
 
-    private func setLaneAutoApproval(_ row: AgentMonitorPillProps.Outbound, enabled: Bool) {
-        guard !isChangingAutoApproval,
-              let observerEndpoint = props.endpoint
-        else { return }
-        let rowKey = beginRowAction(row.rowKey)
-        let reference = DomainAgentSessionLinkReference(linkID: row.linkID, generation: row.generation)
-        Task {
-            let applied = await AgentSessionLinkRuntimeBridge.shared.setAutoApproval(
-                enabled,
-                observerEndpoint: observerEndpoint,
-                targetEndpoint: row.targetEndpoint,
-                expectedReference: reference
-            )
-            busyRowKeys.remove(rowKey)
-            setRowFeedback(rowKey, applied ? nil : .failure(AgentMonitorAutoApprovalCopy.unavailableMessage))
-        }
-    }
-
-    /// The user's explicit management delegation for this exact lane. The checkbox renders only what
-    /// the authority reports back through the next projection, never an optimistic value.
-    private func setLaneManagement(_ row: AgentMonitorPillProps.Outbound, enabled: Bool) {
-        guard let observerEndpoint = props.endpoint else { return }
-        let rowKey = beginRowAction(row.rowKey)
-        let reference = DomainAgentSessionLinkReference(linkID: row.linkID, generation: row.generation)
-        Task {
-            let report = await AgentSessionLinkRuntimeBridge.shared.setManagementReporting(
-                enabled,
-                observerEndpoint: observerEndpoint,
-                targetEndpoint: row.targetEndpoint,
-                expectedReference: reference
-            )
-            busyRowKeys.remove(rowKey)
-            // Authority already changed when this returns; the notice line says only how the running
-            // overseer learns about it, and never claims awareness a provider did not confirm.
-            let feedback: AgentMonitorRowFeedback? = switch report {
-            case .failed:
-                .failure(AgentMonitorManagementCopy.unavailableMessage)
-            case .unchanged:
-                nil
-            case let .changed(notice):
-                .notice(notice.dashboardMessage)
-            }
-            setRowFeedback(rowKey, feedback)
-        }
-    }
-
-    /// Noninteractive role chip. The row's own accessibility value already states the role, so the
-    /// chip is hidden from VoiceOver rather than announced twice.
-    private func managementBadge(_ title: String, tooltip: String) -> some View {
-        Text(title)
-            .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1)
-            .background(Color.purple.opacity(0.18))
-            .clipShape(Capsule())
-            .fixedSize()
-            .hoverTooltip(tooltip, .top)
-            .accessibilityHidden(true)
-    }
-
-    private func setAllCurrentAutoApproval(enabled: Bool) {
-        guard !isChangingAutoApproval,
-              let observerEndpoint = props.endpoint
-        else { return }
-        isChangingAutoApproval = true
-        autoApprovalFailureMessage = nil
-        Task {
-            let applied = await AgentSessionLinkRuntimeBridge.shared.setAutoApprovalForCurrentLinks(
-                enabled,
-                observerEndpoint: observerEndpoint
-            )
-            isChangingAutoApproval = false
-            autoApprovalFailureMessage = applied ? nil : AgentMonitorAutoApprovalCopy.unavailableMessage
-        }
-    }
-
     private func setLaneAutoWake(_ row: AgentMonitorPillProps.Outbound, enabled: Bool) {
         var selected = props.autoWakeTargetSessionIDs
         if enabled {
@@ -1564,27 +1427,12 @@ struct AgentMonitorPopoverView: View {
     private func submit() {
         guard props.canAdd, preview != nil, !isWorking, let observerSessionID = props.sessionID else { return }
         let raw = identifierText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let grantsManagement = managesNewLink
-        let observerEndpoint = props.endpoint
         isWorking = true
         Task {
             let outcome = await AgentSessionLinkRuntimeBridge.shared.addMonitorLink(
                 observerSessionID: observerSessionID,
                 rawTargetSessionID: raw
             )
-            var managementFailed = false
-            if grantsManagement, let observerEndpoint {
-                switch outcome {
-                case let .added(linkID, _), let .alreadyLinked(linkID, _):
-                    let granted = await AgentSessionLinkRuntimeBridge.shared.grantManagement(
-                        observerEndpoint: observerEndpoint,
-                        linkID: linkID
-                    )
-                    managementFailed = !granted
-                case .failed, .rejected:
-                    break
-                }
-            }
             isWorking = false
             if let message = outcome.failureMessage {
                 validationMessage = message
@@ -1592,8 +1440,7 @@ struct AgentMonitorPopoverView: View {
             } else {
                 identifierText = ""
                 preview = nil
-                managesNewLink = false
-                validationMessage = managementFailed ? AgentMonitorManagementCopy.addGrantFailedMessage : nil
+                validationMessage = nil
             }
         }
     }

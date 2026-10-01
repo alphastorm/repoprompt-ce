@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptInstrumentation
 import SwiftUI
 
 enum FileTreeOption: String, CaseIterable, Identifiable, Codable {
@@ -2273,6 +2274,7 @@ class PromptViewModel: ObservableObject {
     private let settingsManager: SettingsManaging
     private let storedPromptPersistence: any StoredPromptPersistenceServing
     private let promptClipboardPasteboard: NSPasteboard
+    private let perfRecorder: any AgentModePerfRecording
 
     #if DEBUG
         var clipboardContentBuilderOverrideForTesting: (() async -> String?)?
@@ -2287,7 +2289,8 @@ class PromptViewModel: ObservableObject {
         settingsManager: SettingsManaging,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         promptClipboardPasteboard: NSPasteboard = .general,
-        refreshAvailableModelsOnInit: Bool = true
+        refreshAvailableModelsOnInit: Bool = true,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.fileManager = fileManager
         gitViewModel = GitViewModel(fileManager: fileManager)
@@ -2297,6 +2300,7 @@ class PromptViewModel: ObservableObject {
         self.settingsManager = settingsManager
         self.storedPromptPersistence = storedPromptPersistence ?? StoredPromptPersistenceService()
         self.promptClipboardPasteboard = promptClipboardPasteboard
+        self.perfRecorder = perfRecorder
         codeMapsGloballyDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
 
         // Removed usage of workspaceManager to load an initial prompt
@@ -2665,7 +2669,7 @@ class PromptViewModel: ObservableObject {
         let issues = await notifyComposeTabsDidRemove(tabIDs, reason: reason, workspaceID: workspaceID)
         #if DEBUG
             for tabID in tabIDs {
-                AgentModePerfDiagnostics.markSidebarDeleteFullCleanupComplete(
+                perfRecorder.markSidebarDeleteFullCleanupComplete(
                     tabID: tabID,
                     source: "PromptViewModel.runPostProjectionComposeTabCleanup",
                     fields: ["reason": String(describing: reason)]
@@ -3910,12 +3914,16 @@ class PromptViewModel: ObservableObject {
     func stashComposeTabs(
         withIDs ids: Set<UUID>,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
+        postPreflightValidation: (@MainActor () -> Bool)? = nil,
+        expandCascade: Bool = true,
         onProjectionRemovalCommitted: ComposeTabsProjectionRemovalCallback? = nil
     ) async -> ComposeTabMutationReport {
         await removeComposeTabs(
             withIDs: ids,
             reason: .stash,
+            expandCascade: expandCascade,
             isMutationContextCurrent: isMutationContextCurrent,
+            postPreflightValidation: postPreflightValidation,
             onProjectionRemovalCommitted: onProjectionRemovalCommitted
         )
     }
@@ -4178,7 +4186,7 @@ class PromptViewModel: ObservableObject {
             onProjectionRemovalCommitted?(tabsBeingClosed)
             #if DEBUG
                 for tabID in tabsBeingClosed {
-                    AgentModePerfDiagnostics.markSidebarDeleteVisibleRemoved(
+                    perfRecorder.markSidebarDeleteVisibleRemoved(
                         tabID: tabID,
                         source: "PromptViewModel.closeComposeTabs.currentComposeTabs",
                         fields: ["reason": String(describing: reason)]
@@ -4235,7 +4243,7 @@ class PromptViewModel: ObservableObject {
         onProjectionRemovalCommitted?(tabsBeingClosed)
         #if DEBUG
             for tabID in tabsBeingClosed {
-                AgentModePerfDiagnostics.markSidebarDeleteVisibleRemoved(
+                perfRecorder.markSidebarDeleteVisibleRemoved(
                     tabID: tabID,
                     source: "PromptViewModel.closeComposeTabs.currentComposeTabs",
                     fields: ["reason": String(describing: reason)]

@@ -13,7 +13,11 @@ import Logging
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptRegexCore
 import RepoPromptShared
+import RepoPromptWorkspaceCore
 
 enum ReadFileAutoSelectionCoverageCertificateMissReason: String, CaseIterable, Hashable {
     case noCertificate = "no_certificate"
@@ -699,6 +703,7 @@ final class MCPServerViewModel: ObservableObject {
     // ---------------------------------------------------------------------
     let windowID: Int
     private(set) var service: MCPService
+    private let perfRecorder: any AgentModePerfRecording
     let logger = Logger(label: "com.repoprompt.mcp")
 
     #if DEBUG
@@ -865,7 +870,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private var agentRunToolService: AgentRunMCPToolService {
-        AgentRunMCPToolService(
+        var toolService = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
@@ -929,6 +934,8 @@ final class MCPServerViewModel: ObservableObject {
                 )
             }
         )
+        toolService.perfRecorder = perfRecorder
+        return toolService
     }
 
     private func resolveAgentRunOracleReviewLaunchSource(
@@ -1136,7 +1143,7 @@ final class MCPServerViewModel: ObservableObject {
     #endif
 
     private var agentExploreToolService: AgentExploreMCPToolService {
-        AgentExploreMCPToolService(
+        var toolService = AgentExploreMCPToolService(
             toolName: MCPWindowToolName.agentExplore,
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
@@ -1179,11 +1186,14 @@ final class MCPServerViewModel: ObservableObject {
                 )
             }
         )
+        toolService.perfRecorder = perfRecorder
+        return toolService
     }
 
     private var agentManageToolService: AgentManageMCPToolService {
         AgentManageMCPToolService(
             toolName: MCPWindowToolName.agentManage,
+            perfRecorder: perfRecorder,
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
             resolveSpawnSourceTabID: { [self] metadata in
@@ -1194,6 +1204,25 @@ final class MCPServerViewModel: ObservableObject {
             },
             bindCurrentRequestToTab: { [self] tabID, metadata in
                 try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: metadata)
+            }
+        )
+    }
+
+    private var agentSelfToolService: AgentSelfMCPToolService {
+        AgentSelfMCPToolService(
+            captureRequestMetadata: { [self] in await captureRequestMetadata() },
+            requireTargetWindow: { [self] in try requireTargetWindow() },
+            resolveObserverEndpoint: { [self] metadata, targetWindow in
+                await resolveAgentSessionLinkObserverEndpoint(metadata: metadata, targetWindow: targetWindow)
+            },
+            captureCallOrigin: { AgentSelfMCPCallOrigin.current },
+            readSelf: { window, endpoint, origin in
+                window.agentModeViewModel.agentSelfContextSnapshot(endpoint: endpoint, origin: origin)
+            },
+            scheduleCompact: { window, endpoint, origin, note, key in
+                await window.agentModeViewModel.agentSelfCompactMCPAdmission(
+                    endpoint: endpoint, origin: origin, note: note, idempotencyKey: key
+                )
             }
         )
     }
@@ -1449,6 +1478,12 @@ final class MCPServerViewModel: ObservableObject {
                 throw MCPError.internalError("Window deallocated while executing agent_session_link")
             }
             return try await agentSessionLinkToolService.execute(args: args)
+        },
+        executeAgentSelf: { [weak self] args in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while executing agent_self")
+            }
+            return try await agentSelfToolService.execute(args: args)
         },
         requireTargetWindow: { [weak self] in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
@@ -3036,6 +3071,7 @@ final class MCPServerViewModel: ObservableObject {
     /// ---------------------------------------------------------------------
     init(
         service: MCPService,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
         promptVM: PromptViewModel,
         oracleVM: OracleViewModel,
         workspaceManager: WorkspaceManagerViewModel,
@@ -3053,6 +3089,7 @@ final class MCPServerViewModel: ObservableObject {
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared
     ) {
         self.service = service
+        self.perfRecorder = perfRecorder
         self.windowID = windowID
         self.promptVM = promptVM
         self.oracleVM = oracleVM
@@ -3757,6 +3794,22 @@ final class MCPServerViewModel: ObservableObject {
         let indexedRunID = shouldRegisterRunToolExecution(toolName: name)
             ? executionRunID
             : nil
+        // Capture the exact self caller at registration, before the tool body can suspend. Neither
+        // request metadata nor a later live tab lookup may substitute a successor run attempt.
+        let selfCallOrigin: AgentSelfMCPCallOrigin? = if name == MCPWindowToolName.agentSelf,
+                                                         let context = resolvedContext?.snapshot,
+                                                         let runID = context.runID,
+                                                         indexedRunID == runID,
+                                                         let window = try? requireTargetWindow(),
+                                                         let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: context.tabID),
+                                                         let session = window.agentModeViewModel.sessions[context.tabID],
+                                                         session.runID == runID,
+                                                         let ownership = session.activeRunOwnership
+        {
+            .init(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID)
+        } else {
+            nil
+        }
 
         // Generate a unique token for this tool execution to prevent cleanup races
         let toolToken = UUID()
@@ -3823,7 +3876,9 @@ final class MCPServerViewModel: ObservableObject {
                         EditFlowPerf.Stage.MCPToolCall.providerExecution,
                         EditFlowPerf.Dimensions(toolName: name)
                     ) {
-                        try await body()
+                        try await AgentSelfMCPCallOrigin.$current.withValue(selfCallOrigin) {
+                            try await body()
+                        }
                     }
                     EditFlowPerf.lifecycleEvent(
                         EditFlowPerf.Lifecycle.MCPRunTool.providerEnded,

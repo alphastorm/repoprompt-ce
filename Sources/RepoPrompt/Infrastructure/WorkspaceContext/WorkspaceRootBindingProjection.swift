@@ -1,5 +1,8 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptWorkspaceCore
 
 struct WorkspaceRootBindingProjection: Equatable {
     let sessionID: UUID
@@ -363,8 +366,8 @@ struct WorkspaceRootBindingProjectionMaterializer {
         startupContext: WorktreeStartupContext? = nil,
         initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:]
     ) async throws -> WorkspaceRootBindingProjectionPreparation {
-        let startMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
-        AgentSelectedFilesDiagnostics.event(
+        let startMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).event(
             "projection.prepare.start",
             fields: [
                 "sessionID": AgentSelectedFilesDiagnostics.shortID(sessionID),
@@ -380,7 +383,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
             startupContext: startupContext,
             initializationHintsByBindingID: initializationHintsByBindingID
         )
-        AgentSelectedFilesDiagnostics.durationEvent(
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent(
             "projection.prepare",
             startMS: startMS,
             fields: [
@@ -418,7 +421,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
             logicalRootsByPath[logicalPath] = logicalRoot
         }
 
-        let ownershipStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        let ownershipStartMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
         var initializationHintsByPhysicalRootPath: [String: WorkspaceRootMaterializationHint] = [:]
         #if DEBUG
             var receiptProjectionDecision = WorktreeStartupInstrumentation.ReceiptProjectionDecision()
@@ -456,7 +459,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
             startupContext: startupContext,
             initializationHintsByPhysicalRootPath: initializationHintsByPhysicalRootPath
         )
-        AgentSelectedFilesDiagnostics.durationEvent(
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent(
             "projection.prepareOwnership",
             startMS: ownershipStartMS,
             fields: [
@@ -478,8 +481,8 @@ struct WorkspaceRootBindingProjectionMaterializer {
     func commit(
         _ preparation: WorkspaceRootBindingProjectionPreparation
     ) async throws -> WorkspaceRootBindingProjection? {
-        let startMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
-        let commitOwnershipStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        let startMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
+        let commitOwnershipStartMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
         let records: [WorkspaceSessionWorktreeOwnedRoot]
         do {
             records = try await store.commitSessionWorktreeOwnership(preparation.ownership)
@@ -489,7 +492,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
             #endif
             throw error
         }
-        AgentSelectedFilesDiagnostics.durationEvent(
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent(
             "projection.commitOwnership",
             startMS: commitOwnershipStartMS,
             fields: [
@@ -558,7 +561,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
                 boundRoots: boundRoots,
                 visibleLogicalRoots: preparation.visibleRoots
             )
-            AgentSelectedFilesDiagnostics.durationEvent(
+            AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent(
                 "projection.commit",
                 startMS: startMS,
                 fields: [
@@ -615,8 +618,8 @@ struct WorkspaceRootBindingProjectionMaterializer {
         bindings: [AgentSessionWorktreeBinding],
         visibleRoots suppliedVisibleRoots: [WorkspaceRootRef]?
     ) async -> WorkspaceRootBindingProjection? {
-        let startMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
-        AgentSelectedFilesDiagnostics.event(
+        let startMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).event(
             "projection.materialize.start",
             fields: [
                 "sessionID": AgentSelectedFilesDiagnostics.shortID(sessionID),
@@ -630,13 +633,13 @@ struct WorkspaceRootBindingProjectionMaterializer {
             var prepareNanoseconds: UInt64 = 0
             var commitNanoseconds: UInt64 = 0
         #endif
-        let visibleRootsStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        let visibleRootsStartMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
         let visibleRoots = if let suppliedVisibleRoots {
             suppliedVisibleRoots
         } else {
             await store.rootRefs(scope: .visibleWorkspace)
         }
-        AgentSelectedFilesDiagnostics.durationEvent(
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent(
             "projection.materialize.visibleRoots",
             startMS: visibleRootsStartMS,
             fields: ["visibleRootCount": String(visibleRoots.count)]
@@ -677,7 +680,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
                         commitNanoseconds: commitNanoseconds
                     )
                 #endif
-                AgentSelectedFilesDiagnostics.durationEvent(
+                AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent(
                     "projection.materialize.complete",
                     startMS: startMS,
                     fields: [
@@ -700,7 +703,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
                         commitNanoseconds: commitNanoseconds
                     )
                 #endif
-                AgentSelectedFilesDiagnostics.durationEvent(
+                AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent(
                     "projection.materialize.commitFailed",
                     startMS: startMS,
                     fields: [
@@ -722,7 +725,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
                     commitNanoseconds: commitNanoseconds
                 )
             #endif
-            AgentSelectedFilesDiagnostics.durationEvent(
+            AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent(
                 "projection.materialize.prepareFailed",
                 startMS: startMS,
                 fields: [

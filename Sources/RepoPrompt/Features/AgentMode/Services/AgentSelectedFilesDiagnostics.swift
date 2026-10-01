@@ -1,51 +1,54 @@
 import Foundation
+import RepoPromptInstrumentation
 
-enum AgentSelectedFilesDiagnostics {
-    static func timestampMSIfEnabled() -> Double? {
+struct AgentSelectedFilesDiagnostics {
+    let perfRecorder: any AgentModePerfRecording
+
+    func timestampMSIfEnabled() -> Double? {
         #if DEBUG
-            AgentModePerfDiagnostics.timestampMSIfEnabled()
+            perfRecorder.timestampMSIfEnabled()
         #else
             nil
         #endif
     }
 
-    static func elapsedFields(since startMS: Double?) -> [String: String] {
+    func elapsedFields(since startMS: Double?) -> [String: String] {
         #if DEBUG
             guard let startMS else { return [:] }
-            return ["duration": AgentModePerfDiagnostics.formatElapsedMS(since: startMS)]
+            return ["duration": perfRecorder.formatElapsedMS(since: startMS)]
         #else
             [:]
         #endif
     }
 
-    static func event(
+    func event(
         _ name: String,
         fields: [String: String] = [:],
         includeStack: Bool = false
     ) {
         #if DEBUG
-            guard AgentModePerfDiagnostics.isEnabled else { return }
+            guard perfRecorder.isEnabled else { return }
             var fields = fields
             if includeStack {
-                fields["stack"] = compactCallStack()
+                fields["stack"] = Self.compactCallStack()
             }
-            AgentModePerfDiagnostics.event("selectedFiles.\(name)", fields: fields)
+            perfRecorder.event("selectedFiles.\(name)", fields: fields)
         #endif
     }
 
-    static func durationEvent(
+    func durationEvent(
         _ name: String,
         startMS: Double?,
         fields: [String: String] = [:]
     ) {
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent("selectedFiles.\(name)", startMS: startMS, fields: fields)
+            perfRecorder.durationEvent("selectedFiles.\(name)", startMS: startMS, fields: fields)
         #endif
     }
 
     static func shortID(_ id: UUID?) -> String {
         #if DEBUG
-            AgentModePerfDiagnostics.shortID(id)
+            NoopAgentModePerfRecorder().shortID(id)
         #else
             "nil"
         #endif

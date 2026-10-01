@@ -1,5 +1,7 @@
 import Foundation
 import MCP
+import RepoPromptFoundation
+import RepoPromptInstrumentation
 #if canImport(Darwin)
     import Darwin
 #endif
@@ -367,6 +369,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private static let repeatedResumeTimeoutFallbackThreshold = 2
     private let preferenceDefaults: UserDefaults
+    private let catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink
+    private let perfRecorder: any AgentModePerfRecording
 
     init(
         windowID: Int,
@@ -388,6 +392,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         transportClosedRecoveryGraceInterval: TimeInterval = 1.5,
         recoveryProbeTimeout: TimeInterval = 2.0,
         preferenceDefaults: UserDefaults = .standard,
+        catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink(),
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
         initialLastUsedReasoningEffort: CodexReasoningEffort? = nil,
         initialLastUsedReasoningEffortsByModelSlug: [String: CodexReasoningEffort] = [:]
     ) {
@@ -417,6 +423,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         codexTransportClosedRecoveryGraceInterval = max(0.1, transportClosedRecoveryGraceInterval)
         codexRecoveryProbeTimeout = max(0.1, recoveryProbeTimeout)
         self.preferenceDefaults = preferenceDefaults
+        self.catalogDiagnosticsSink = catalogDiagnosticsSink
+        self.perfRecorder = perfRecorder
         lastUsedReasoningEffort = initialLastUsedReasoningEffort
         lastUsedReasoningEffortByModelSlug = initialLastUsedReasoningEffortsByModelSlug.reduce(into: [:]) { result, entry in
             let key = entry.key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1808,14 +1816,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         fields: [String: String] = [:]
     ) {
         #if DEBUG
-            guard AgentModePerfDiagnostics.isEnabled else { return }
-            AgentModePerfDiagnostics.increment(
+            guard perfRecorder.isEnabled else { return }
+            perfRecorder.increment(
                 "provider.codex.watchdog.\(transition)",
                 tabID: session.tabID
             )
             var redactedFields = fields
             redactedFields["transition"] = transition
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "provider.codex.watchdog.transition",
                 tabID: session.tabID,
                 fields: redactedFields
@@ -2410,22 +2418,96 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             try await controller.compactThread()
             return .succeeded("Requested Codex context compaction.")
         } catch {
-            resetTrackedCodexTurns(session)
-            if !session.codexFallbackQueue.isEmpty || session.codexFallbackDispatchInFlight != nil {
-                abandonCodexFallbackQueue(
-                    session: session,
-                    reason: "Codex queued follow-ups were cancelled because context compaction failed to start."
-                )
-            }
-            if let ownership = session.activeRunOwnership {
-                _ = session.endRunAttempt(ifCurrent: ownership, source: "codex.compaction.startFailed")
-            }
-            viewModel?.setAgentRunActive(session.tabID, isActive: false)
-            session.runState = .idle
-            setRunningStatus(nil, source: nil, session: session)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-            viewModel?.scheduleSave(for: session.tabID)
+            unwindFailedCodexCompactionStart(session)
             return .failed("Codex context compaction failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Restores the idle state a compaction that failed to start leaves behind. Shared by the local
+    /// `/compact` command and the overseer path so the two can never unwind differently.
+    private func unwindFailedCodexCompactionStart(_ session: AgentTabSession) {
+        resetTrackedCodexTurns(session)
+        if !session.codexFallbackQueue.isEmpty || session.codexFallbackDispatchInFlight != nil {
+            abandonCodexFallbackQueue(
+                session: session,
+                reason: "Codex queued follow-ups were cancelled because context compaction failed to start."
+            )
+        }
+        if let ownership = session.activeRunOwnership {
+            _ = session.endRunAttempt(ifCurrent: ownership, source: "codex.compaction.startFailed")
+        }
+        viewModel?.setAgentRunActive(session.tabID, isActive: false)
+        session.runState = .idle
+        setRunningStatus(nil, source: nil, session: session)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.scheduleSave(for: session.tabID)
+    }
+
+    /// How an overseer-requested Codex compaction ended at its provider boundary.
+    enum OversightCompactionStart: Equatable {
+        /// `thread/compact/start` was accepted; the compaction turn is running.
+        case started
+        /// Nothing was sent: the thread was unavailable, or admission no longer held after the
+        /// session was prepared.
+        case notStarted
+        /// The request was attempted and failed; the run state was unwound exactly as the local
+        /// `/compact` command unwinds it.
+        case startFailed(String)
+    }
+
+    /// Starts a native Codex compaction for an overseer-authorized, already-admitted target.
+    ///
+    /// The same core as the local `/compact` command, with one addition the local path does not need:
+    /// preparing the session can suspend (reconnect or resume), so `isStillAdmissible` is re-checked
+    /// after that suspension and immediately before the run is claimed. Nothing is sent when it no
+    /// longer holds. Never falls back to a fresh thread, and never sends a message.
+    func startOversightCompaction(
+        session: AgentTabSession,
+        expectedThreadID: String,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        isStillAdmissible: () -> Bool
+    ) async -> OversightCompactionStart {
+        guard nativeSlashCommandAvailabilityMessage(.compact, session: session) == nil,
+              session.codexConversationID == expectedThreadID
+        else {
+            return .notStarted
+        }
+        if session.codexController == nil, hasPersistedCodexThreadMetadata(session) {
+            session.codexNeedsReconnect = true
+        }
+        // Never a fresh thread: compacting an empty replacement would report success while the
+        // conversation the overseer meant is no longer attached.
+        await ensureCodexNativeSession(
+            session: session,
+            allowMissingRolloutFallback: false,
+            allowResumeTimeoutFallback: false,
+            forIdleNativeCompact: true
+        )
+        guard isStillAdmissible(),
+              session.codexConversationID == expectedThreadID,
+              nativeSlashCommandAvailabilityMessage(.compact, session: session) == nil,
+              let controller = session.codexController,
+              controller.hasActiveThread
+        else {
+            return .notStarted
+        }
+        beginCodexCompaction(session)
+        if let selfCompactDispatchID {
+            guard session.selfCompactNativeCompletion?.bindCompact(
+                selfCompactDispatchID,
+                runID: session.runID,
+                runAttemptID: session.activeRunAttemptID
+            ) == true else {
+                unwindFailedCodexCompactionStart(session)
+                return .notStarted
+            }
+        }
+        do {
+            try await controller.compactThread()
+            return .started
+        } catch {
+            unwindFailedCodexCompactionStart(session)
+            return .startFailed(error.localizedDescription)
         }
     }
 
@@ -2855,11 +2937,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentTabSession
     ) {
         #if DEBUG
-            AgentModePerfDiagnostics.increment(
+            perfRecorder.increment(
                 "codex.turn_start.rejected.\(reason)",
                 tabID: session.tabID
             )
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "codex.turnStartRejected",
                 tabID: session.tabID,
                 fields: [
@@ -2877,11 +2959,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentTabSession
     ) {
         #if DEBUG
-            AgentModePerfDiagnostics.increment(
+            perfRecorder.increment(
                 "codex.turn_completion.rejected.\(reason)",
                 tabID: session.tabID
             )
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "codex.turnCompletionRejected",
                 tabID: session.tabID,
                 fields: [
@@ -2983,7 +3065,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private func fallbackSubmissionContext(
         _ context: AgentTabSession.CodexFallbackSubmissionContext?,
         text: String,
-        images: [AgentImageAttachment]
+        images: [AgentImageAttachment],
+        stopFence: AgentRunStartStopFence
     ) -> AgentTabSession.CodexFallbackSubmissionContext {
         context ?? .init(
             queueID: UUID(),
@@ -2993,7 +3076,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             draftText: text,
             optimisticUserItemID: nil,
             origin: .manual,
-            dispatchTicket: nil
+            dispatchTicket: nil,
+            stopFence: stopFence
         )
     }
 
@@ -3020,15 +3104,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         autoEffortApplied: Bool,
         attachmentReservationID: UUID?,
         reason: CodexTurnFallbackDecision,
-        controller: any CodexSessionControlling
+        controller: any CodexSessionControlling,
+        stopFence: AgentRunStartStopFence
     ) -> NativeSendOutcome {
+        guard stopFence.permitsStart(of: session) else { return .stale(reason: "Codex queued fallback was invalidated by Stop.") }
         guard let threadID = session.codexConversationID,
               let runID = session.runID,
               let runAttemptID = session.activeRunAttemptID
         else {
             return .stale(reason: "Codex could not queue fallback delivery because its run lineage changed.")
         }
-        let submission = fallbackSubmissionContext(context, text: text, images: images)
+        let submission = fallbackSubmissionContext(context, text: text, images: images, stopFence: stopFence)
         if session.codexFallbackQueue.contains(where: { $0.id == submission.queueID })
             || session.codexFallbackDispatchInFlight?.id == submission.queueID
         {
@@ -3063,7 +3149,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             originRunAttemptID: runAttemptID,
             blockingTurn: recoverableCodexFallbackBlockingTurn(session: session),
             state: .queued,
-            monitoringDispatchContext: AgentSessionLinkDispatchContext(session: session, dispatchID: .codexFallback(queueID: submission.queueID))
+            monitoringDispatchContext: AgentSessionLinkDispatchContext(session: session, dispatchID: .codexFallback(queueID: submission.queueID)),
+            stopFence: submission.stopFence ?? stopFence
         )
         detachCodexFallbackAttachmentReservation(attachmentReservationID, session: session)
         session.codexFallbackQueue.append(entry)
@@ -3197,7 +3284,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
               ObjectIdentifier(controller) == head.originControllerInstanceID,
               session.codexControllerGeneration == head.originControllerGeneration,
               session.codexConversationID == head.originThreadID,
-              session.runID == head.originRunID
+              session.runID == head.originRunID,
+              head.stopFence?.permitsStart(of: session) ?? true
         else { return nil }
         if beginsSuccessorAttempt {
             guard !session.runState.isActive else { return nil }
@@ -3969,7 +4057,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
-    private func hasKnownCodexThread(_ session: AgentTabSession) -> Bool {
+    func hasKnownCodexThread(_ session: AgentTabSession) -> Bool {
         if session.codexController?.hasActiveThread == true {
             return true
         }
@@ -4058,11 +4146,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             // Closed before any teardown rotates the controller generation: leaving it would encode a
             // spent repair cycle on a session that no longer has a Codex catalog to repair.
             if session.codexSessionLinkCatalogRepairCycle != nil {
-                AgentSessionLinkCatalogDiagnostics.repairTransition(
+                catalogDiagnosticsSink.record(.repairTransition(
                     runID: session.runID,
                     tabID: session.tabID,
                     outcome: .closedProviderChanged
-                )
+                ))
             }
             session.codexSessionLinkCatalogRepairCycle = nil
             cancelCodexThreadNameSync(for: session.tabID)
@@ -4366,6 +4454,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         return MCPBootstrapLease(
             spec: leaseSpec,
+            perfRecorder: perfRecorder,
             mcpServerEnabler: { [weak viewModel] in
                 await viewModel?.ensureMCPServerEnabledForThreadStart() ?? false
             },
@@ -5850,11 +5939,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) else {
             session.codexSessionLinkCatalogRepairCycle = nil
             logCodex("[AgentModeVM][CodexSessionLinkRepair] closed tab=\(session.tabID) reason=tool-disabled")
-            AgentSessionLinkCatalogDiagnostics.repairTransition(
+            catalogDiagnosticsSink.record(.repairTransition(
                 runID: cycleRunID,
                 tabID: session.tabID,
                 outcome: .closedToolDisabled
-            )
+            ))
             return
         }
         guard isQuiescentForControllerReplacement(session) else {
@@ -5881,11 +5970,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 AgentModeProcessRunIdentity.clearProcessRunID(for: session)
                 session.codexSessionLinkCatalogRepairCycle = nil
                 logCodex("[AgentModeVM][CodexSessionLinkRepair] retired-stranded-run tab=\(session.tabID)")
-                AgentSessionLinkCatalogDiagnostics.repairTransition(
+                catalogDiagnosticsSink.record(.repairTransition(
                     runID: cycleRunID,
                     tabID: session.tabID,
                     outcome: .spentStrandedRunRetired
-                )
+                ))
             } else {
                 logCodex("[AgentModeVM][CodexSessionLinkRepair] consumed tab=\(session.tabID)")
             }
@@ -5903,11 +5992,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 preserveRunID: false
             )
             logCodex("[AgentModeVM][CodexSessionLinkRepair] replaced tab=\(session.tabID)")
-            AgentSessionLinkCatalogDiagnostics.repairTransition(
+            catalogDiagnosticsSink.record(.repairTransition(
                 runID: cycleRunID,
                 tabID: session.tabID,
                 outcome: .spentReplaced
-            )
+            ))
             viewModel?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
         }
     }
@@ -6130,6 +6219,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         policyAlreadyInstalled: Bool = false,
         allowMissingRolloutFallback: Bool = true,
         allowResumeTimeoutFallback: Bool = true,
+        forIdleNativeCompact: Bool = false,
         deferReconnectForCurrentActiveTurn: Bool = false,
         preserveExistingRunID: Bool = false,
         skipResumeWhenNoPriorCodexHistory: Bool = false,
@@ -6165,6 +6255,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     policyAlreadyInstalled: false,
                     allowMissingRolloutFallback: allowMissingRolloutFallback,
                     allowResumeTimeoutFallback: allowResumeTimeoutFallback,
+                    forIdleNativeCompact: forIdleNativeCompact,
                     skipResumeWhenNoPriorCodexHistory: false,
                     semanticRunState: semanticRunState
                 )
@@ -6464,12 +6555,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 policyAlreadyInstalled: false,
                 allowMissingRolloutFallback: allowMissingRolloutFallback,
                 allowResumeTimeoutFallback: allowResumeTimeoutFallback,
+                forIdleNativeCompact: forIdleNativeCompact,
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState
             )
             return
         }
+        // Exact idle compact resumes only for a control-plane request, not an active model turn.
+        // The next ordinary turn establishes its own routed tool policy.
         let shouldInstallPolicy = shouldManageCodexTooling
+            && !forIdleNativeCompact
             && shouldBootstrapSessionInitialization
             && !policyAlreadyInstalled
             && requiresTransportStart
@@ -6502,6 +6597,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 policyAlreadyInstalled: true,
                 allowMissingRolloutFallback: allowMissingRolloutFallback,
                 allowResumeTimeoutFallback: allowResumeTimeoutFallback,
+                forIdleNativeCompact: forIdleNativeCompact,
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState
             )
@@ -6789,69 +6885,47 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return .steer(identity)
     }
 
-    /// Whether a RepoPrompt oversight notice can be steered into this session's exact active user
-    /// turn right now. Pure: the same plan `sendCodexNativeMessage` would compute for a steer.
-    func canSteerOversightNotice(session: AgentTabSession) -> Bool {
-        guard session.selectedAgent == .codexExec,
-              session.runState == .running,
-              session.codexController != nil,
-              case .steer = codexTurnDispatchPlan(wasRunAlreadyActive: true, session: session)
-        else { return false }
-        return true
-    }
-
-    /// Steers one RepoPrompt-authored oversight notice into the exact active Codex user turn.
-    ///
-    /// Deliberately not `sendCodexNativeMessage`: that path owns run lifecycle (running status, auth
-    /// retry, fallback queueing, first-turn start) that a notice must never touch. This is one
-    /// `turn/steer` against the turn identity classified in the same main-actor pass, with no retry
-    /// onto a different turn and no fallback — a turn that ended or changed simply does not take it,
-    /// and the caller keeps the notice owed. No transcript row, oversight claim, or composer state is
-    /// read or written here.
-    ///
-    /// - Returns: `true` only when Codex accepted the notice into a live turn of this thread.
-    func steerOversightNotice(session: AgentTabSession, text: String) async -> Bool {
-        guard session.selectedAgent == .codexExec,
-              session.runState == .running,
-              let controller = session.codexController,
-              case let .steer(identity) = codexTurnDispatchPlan(wasRunAlreadyActive: true, session: session)
-        else { return false }
-        do {
-            let receipt = try await controller.steerUserTurn(
-                text: text,
-                images: [],
-                expectedTurnID: identity.turnID
-            )
-            if receipt.acceptedTurnID != identity.turnID {
-                // Accepted by the thread's current turn rather than the one classified: the model
-                // still received it, and lifecycle bookkeeping is reconciled exactly as for a user
-                // steer that landed on a successor turn.
-                await reconcileAcceptedCodexSteerMismatch(
-                    from: identity,
-                    acceptedTurnID: receipt.acceptedTurnID,
-                    controller: controller,
-                    session: session
-                )
-            }
-            return true
-        } catch {
-            logCodex("[AgentModeVM] steerOversightNotice: not accepted: \(error)")
-            return false
-        }
-    }
-
     @discardableResult
     func sendCodexNativeMessage(
         session: AgentTabSession,
         text: String,
         attachments: [AgentImageAttachment],
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
+        stopFence: AgentRunStartStopFence? = nil,
         attachmentReservationID: UUID? = nil,
         policyAlreadyInstalled: Bool = false,
         terminalizeRejectedSend: Bool = true,
-        autoEffortSelection: AutoEffortTurnSelection? = nil
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
     ) async -> NativeSendOutcome {
+        let effectiveStopFence = stopFence ?? fallbackContext?.stopFence ?? AgentRunStartStopFence(session: session)
+        guard effectiveStopFence.permitsStart(of: session) else { return .cancelled }
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")
+        let isSelfNote = selfCompactDispatchID?.stage == .note
+        if isSelfNote {
+            guard let selfCompactDispatchID,
+                  session.selfCompactNoteDispatchIsCurrent(selfCompactDispatchID),
+                  let active = session.selfCompactState.active,
+                  active.id == selfCompactDispatchID.requestID,
+                  active.phase == .dispatchingNote,
+                  active.owner?.matchesLocalBinding(session) == true,
+                  active.compactProviderConversation == session.codexConversationID,
+                  text == AgentSelfCompactNoteEnvelope.frame(active.note),
+                  attachments.isEmpty,
+                  fallbackContext == nil
+            else { return .preDispatchRejected(message: "Continuation note admission changed before Codex dispatch.") }
+        }
+        func parkedNoteForCurrentBinding() -> (dispatchID: AgentSelfCompactionDispatchID, frame: String)? {
+            var state = session.selfCompactState
+            if state.cancelStaleParkedNote(for: session) {
+                session.selfCompactState = state
+                viewModel?.scheduleSave(for: session.tabID)
+            }
+            guard let parked = session.selfCompactState.parkedNote,
+                  session.selfCompactNoteDispatchIsCurrent(parked.dispatchID)
+            else { return nil }
+            return parked
+        }
         let auditTurnID = fallbackContext?.optimisticUserItemID
             ?? session.pendingTurnRuntimeAnchors.first?.userItemID
         let wasRunAlreadyActive = session.runState.isActive
@@ -6942,7 +7016,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             reasoningEffort: initialSelection.reasoningEffort,
             serviceTier: initialSelection.serviceTier
         )
-        session.codexPendingAuthRetryTurn = .init(
+        if !isSelfNote { session.codexPendingAuthRetryTurn = .init(
             text: text,
             images: attachments,
             model: selection.model,
@@ -6954,13 +7028,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 : nil,
             auditTurnID: auditTurnID,
             autoEffortApplied: initialSelection.isAuto
-        )
+        ) }
 
         await ensureCodexNativeSession(
             session: session,
             policyAlreadyInstalled: policyAlreadyInstalled,
+            allowMissingRolloutFallback: !isSelfNote,
+            allowResumeTimeoutFallback: !isSelfNote,
             deferReconnectForCurrentActiveTurn: wasRunAlreadyActive,
-            skipResumeWhenNoPriorCodexHistory: !wasRunAlreadyActive && !hadResumeEligibleCodexHistoryBeforeSend
+            skipResumeWhenNoPriorCodexHistory: !isSelfNote && !wasRunAlreadyActive && !hadResumeEligibleCodexHistoryBeforeSend
         )
         if Task.isCancelled {
             // The run was cancelled during startup — e.g. while the MCP routing wait was suspended. The
@@ -7044,7 +7120,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             wasRunAlreadyActive: wasRunAlreadyActive,
             session: session
         )
+        if isSelfNote {
+            guard case .start = dispatchPlan,
+                  session.selfCompactState.active?.compactProviderConversation == session.codexConversationID
+            else {
+                return .preDispatchRejected(message: "Codex could not start the continuation note on its original thread.")
+            }
+        }
         if case let .fallback(decision) = dispatchPlan {
+            if isSelfNote {
+                return .preDispatchRejected(message: "Codex did not send the continuation note because a direct turn was unavailable.")
+            }
             clearCodexPendingAuthRetryTurn(session)
             return enqueueCodexFallback(
                 session: session,
@@ -7055,13 +7141,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 autoEffortApplied: initialSelection.isAuto,
                 attachmentReservationID: attachmentReservationID,
                 reason: decision,
-                controller: controller
+                controller: controller,
+                stopFence: effectiveStopFence
             )
         }
 
         let promptDispatchID = AgentSessionLinkPromptDispatchID.codexNativeSend(sendRunID)
         let expectedControllerID = ObjectIdentifier(controller)
-        let catalogReadiness = await viewModel?.ensureProviderInputCatalogReady(for: session) ?? .unavailable
+        let catalogReadiness: AgentModeViewModel.ProviderInputCatalogReadiness = if isSelfNote {
+            .notRequired
+        } else {
+            await viewModel?.ensureProviderInputCatalogReady(for: session) ?? .unavailable
+        }
         guard catalogReadiness == .ready || catalogReadiness == .notRequired else {
             viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
@@ -7155,6 +7246,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         var monitoring: AgentSessionLinkDecoratedProviderText?
         var acquiredAgentSessionLinkPhysicalDispatch = false
         let prepareAgentSessionLinkPhysicalDispatch: () async -> NativeSendOutcome? = {
+            if isSelfNote {
+                guard let active = session.selfCompactState.active,
+                      active.id == selfCompactDispatchID?.requestID,
+                      active.phase == .dispatchingNote,
+                      active.owner?.matchesLocalBinding(session) == true,
+                      selfCompactDispatchID.map(session.selfCompactNoteDispatchIsCurrent) == true,
+                      active.compactProviderConversation == session.codexConversationID,
+                      session.codexController.map(ObjectIdentifier.init) == expectedControllerID
+                else { return .preDispatchRejected(message: "Continuation note scope changed before Codex dispatch.") }
+                return nil
+            }
             let catalogRouteIsCurrent = catalogReadiness != .ready
                 || self.viewModel?.agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session) == true
             let providerRouteIsCurrent = session.runID == sendRunID
@@ -7263,7 +7365,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             setRunningStatus("Sending message…", source: .transport, session: session, urgent: true)
             switch dispatchPlan {
             case .start:
-                let hookGateDispatchOwnerToken = try await gateFirstTurnForProjectHooks(
+                let hookGateDispatchOwnerToken = isSelfNote ? nil : try await gateFirstTurnForProjectHooks(
                     session: session,
                     controller: controller
                 )
@@ -7280,7 +7382,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     if let rejection = await prepareAgentSessionLinkPhysicalDispatch() {
                         return rejection
                     }
-                    let dispatchText = monitoring?.text ?? text
+                    let parkedNote = isSelfNote ? nil : parkedNoteForCurrentBinding()
+                    let noteDispatchID = selfCompactDispatchID ?? parkedNote?.dispatchID
+                    let baseText = monitoring?.text ?? text
+                    let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                     beginTrackedCodexUserTurn(session)
                     updateCodexStallWatchdogState(for: session)
                     logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.startUserTurn")
@@ -7305,13 +7410,44 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             }
                             viewModel?.scheduleSave(for: session.tabID)
                         }
-                        let receipt = try await controller.startUserTurn(
-                            text: dispatchText,
-                            images: attachments,
-                            model: physicalSelection.model,
-                            reasoningEffort: physicalSelection.reasoningEffort,
-                            serviceTier: physicalSelection.serviceTier
-                        )
+                        if let noteDispatchID {
+                            guard session.selfCompactNoteDispatchIsCurrent(noteDispatchID) else {
+                                throw CancellationError()
+                            }
+                            var state = session.selfCompactState
+                            guard state.noteWillAttempt(noteDispatchID) else {
+                                throw CancellationError()
+                            }
+                            session.selfCompactState = state
+                            viewModel?.scheduleSave(for: session.tabID)
+                        }
+                        let receipt: CodexTurnStartReceipt
+                        do {
+                            receipt = try await controller.startUserTurn(
+                                text: dispatchText,
+                                images: attachments,
+                                model: physicalSelection.model,
+                                reasoningEffort: physicalSelection.reasoningEffort,
+                                serviceTier: physicalSelection.serviceTier
+                            )
+                        } catch {
+                            if let noteDispatchID {
+                                var state = session.selfCompactState
+                                _ = state.noteTransportFailed(noteDispatchID)
+                                session.selfCompactState = state
+                                viewModel?.scheduleSave(for: session.tabID)
+                            }
+                            throw error
+                        }
+                        if let noteDispatchID {
+                            var state = session.selfCompactState
+                            if state.noteAccepted(noteDispatchID) {
+                                session.appendItem(AgentChatItem.selfCompactionNoteRestored(sequenceIndex: session.nextSequenceIndex))
+                                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                            }
+                            session.selfCompactState = state
+                            viewModel?.scheduleSave(for: session.tabID)
+                        }
                         if let auditTurnID {
                             session.updateAutomationAudit(turnID: auditTurnID) {
                                 $0.recordCodexStartAccepted(
@@ -7329,7 +7465,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 if let rejection = await prepareAgentSessionLinkPhysicalDispatch() {
                     return rejection
                 }
-                let dispatchText = monitoring?.text ?? text
+                let parkedNote = parkedNoteForCurrentBinding()
+                let baseText = monitoring?.text ?? text
+                let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.steerUserTurn expectedTurnID=\(identity.turnID)")
                 if let auditTurnID {
                     session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexDispatch(.steer) }
@@ -7341,11 +7479,29 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     viewModel?.scheduleSave(for: session.tabID)
                 }
                 do {
+                    if let parkedNote {
+                        guard session.selfCompactNoteDispatchIsCurrent(parkedNote.dispatchID) else {
+                            return .cancelled
+                        }
+                        var state = session.selfCompactState
+                        guard state.noteWillAttempt(parkedNote.dispatchID) else { return .cancelled }
+                        session.selfCompactState = state
+                        viewModel?.scheduleSave(for: session.tabID)
+                    }
                     let receipt = try await controller.steerUserTurn(
                         text: dispatchText,
                         images: attachments,
                         expectedTurnID: identity.turnID
                     )
+                    if let parkedNote {
+                        var state = session.selfCompactState
+                        if state.noteAccepted(parkedNote.dispatchID) {
+                            session.appendItem(AgentChatItem.selfCompactionNoteRestored(sequenceIndex: session.nextSequenceIndex))
+                            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                        }
+                        session.selfCompactState = state
+                        viewModel?.scheduleSave(for: session.tabID)
+                    }
                     recordAcceptedSteer()
                     if receipt.acceptedTurnID != identity.turnID {
                         await reconcileAcceptedCodexSteerMismatch(
@@ -7356,6 +7512,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         )
                     }
                 } catch let mismatch as CodexTurnSteerError {
+                    if let parkedNote {
+                        // A definitive rejection re-parks the note; the ordinary fallback below then
+                        // carries it exactly once on its own start. An ambiguous one settles instead
+                        // of leaving the one-shot marker claimed forever.
+                        var state = session.selfCompactState
+                        if mismatch.definitivelyRejectsInput {
+                            _ = state.noteDefinitivelyNotAttempted(parkedNote.dispatchID)
+                        } else {
+                            _ = state.noteTransportFailed(parkedNote.dispatchID)
+                        }
+                        session.selfCompactState = state
+                        viewModel?.scheduleSave(for: session.tabID)
+                        throw mismatch
+                    }
                     guard case let .expectedTurnMismatch(expectedTurnID, actualTurnID, failure) = mismatch,
                           let actualTurnID = actualTurnID?.trimmingCharacters(in: .whitespacesAndNewlines),
                           !actualTurnID.isEmpty,
@@ -7412,6 +7582,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             failure: failure
                         )
                     }
+                } catch {
+                    if let parkedNote {
+                        var state = session.selfCompactState
+                        _ = state.noteTransportFailed(parkedNote.dispatchID)
+                        session.selfCompactState = state
+                        viewModel?.scheduleSave(for: session.tabID)
+                    }
+                    throw error
                 }
             case .fallback:
                 preconditionFailure("Fallback dispatch plans return before provider dispatch")
@@ -7506,6 +7684,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 .activeTurnNotSteerable(turnKind: turnKind, failure: failure)
             }
             clearCodexPendingAuthRetryTurn(session)
+            if isSelfNote {
+                return .preDispatchRejected(message: "Codex did not queue the continuation note.")
+            }
             return enqueueCodexFallback(
                 session: session,
                 context: fallbackContext,
@@ -7515,7 +7696,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 autoEffortApplied: initialSelection.isAuto,
                 attachmentReservationID: attachmentReservationID,
                 reason: decision,
-                controller: controller
+                controller: controller,
+                stopFence: effectiveStopFence
             )
         } catch {
             if acquiredAgentSessionLinkPhysicalDispatch {
@@ -8456,7 +8638,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             providerBuffersAreDrained: { [weak self] in
                 self?.codexTerminalBuffersAreDrained(session) == true
             },
-            postCommit: { [weak self] in
+            postCommit: { [weak self] _, _ in
                 guard let self else { return }
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                 // Computer-use settlement runs first on purpose: when it replaces the controller the
@@ -8557,10 +8739,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                   Self.sameCodexControllerInstance(activeController, sourceController)
             else {
                 #if DEBUG
-                    if AgentModePerfDiagnostics.isEnabled {
+                    if perfRecorder.isEnabled {
                         let metricKind = codexEventMetricKind(event)
-                        AgentModePerfDiagnostics.increment("provider.codex.event.staleDropped.\(metricKind)", tabID: session.tabID)
-                        AgentModePerfDiagnostics.event("provider.codex.event.staleDropped", tabID: session.tabID, fields: ["kind": metricKind])
+                        perfRecorder.increment("provider.codex.event.staleDropped.\(metricKind)", tabID: session.tabID)
+                        perfRecorder.event("provider.codex.event.staleDropped", tabID: session.tabID, fields: ["kind": metricKind])
                     }
                 #endif
                 return
@@ -8569,7 +8751,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard codexEventScopeMatches(event, session: session) else {
             #if DEBUG
                 let metricKind = codexEventMetricKind(event)
-                AgentModePerfDiagnostics.increment("provider.codex.event.staleScopeDropped.\(metricKind)", tabID: session.tabID)
+                perfRecorder.increment("provider.codex.event.staleScopeDropped.\(metricKind)", tabID: session.tabID)
             #endif
             return
         }
@@ -8597,10 +8779,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         }
         #if DEBUG
-            if AgentModePerfDiagnostics.isEnabled {
+            if perfRecorder.isEnabled {
                 let metricKind = codexEventMetricKind(event)
-                AgentModePerfDiagnostics.increment("provider.codex.event.accepted.\(metricKind)", tabID: session.tabID)
-                AgentModePerfDiagnostics.event(
+                perfRecorder.increment("provider.codex.event.accepted.\(metricKind)", tabID: session.tabID)
+                perfRecorder.event(
                     "provider.codex.event.accepted",
                     tabID: session.tabID,
                     fields: [
@@ -9035,6 +9217,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if turnKind == .compact {
                 if status == .completed {
                     markCodexContextCompacted(session)
+                    var state = session.selfCompactState
+                    if let active = state.active,
+                       active.compactRunID == session.runID,
+                       active.compactRunAttemptID == session.activeRunAttemptID,
+                       active.phase == .dispatchingCompact || active.phase == .awaitingCompactTurn
+                    {
+                        state.active?.compactTurnSucceeded = true
+                        session.selfCompactState = state
+                        viewModel?.scheduleSave(for: session.tabID)
+                    }
                 }
                 await finalizeCodexRun(
                     session,
@@ -9196,9 +9388,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         message: String
     ) {
         #if DEBUG
-            if AgentModePerfDiagnostics.isEnabled {
-                AgentModePerfDiagnostics.increment("provider.codex.retry.heuristicFallback", tabID: session.tabID)
-                AgentModePerfDiagnostics.event(
+            if perfRecorder.isEnabled {
+                perfRecorder.increment("provider.codex.retry.heuristicFallback", tabID: session.tabID)
+                perfRecorder.event(
                     "provider.codex.retry.heuristicFallback",
                     tabID: session.tabID,
                     fields: ["message": String(message.prefix(160))]
@@ -9969,9 +10161,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] commandExecutionRunning pre-finalize invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)")
         }
         #if DEBUG
-            if AgentModePerfDiagnostics.isEnabled {
-                AgentModePerfDiagnostics.increment("provider.codex.commandRunning.flushBeforeFinalize", tabID: session.tabID)
-                AgentModePerfDiagnostics.event(
+            if perfRecorder.isEnabled {
+                perfRecorder.increment("provider.codex.commandRunning.flushBeforeFinalize", tabID: session.tabID)
+                perfRecorder.event(
                     "provider.codex.commandRunning.flushBeforeFinalize",
                     tabID: session.tabID,
                     fields: [
@@ -10195,12 +10387,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.pendingCommandRunningByKey[key] = runningUpdate
         }
         #if DEBUG
-            if AgentModePerfDiagnostics.isEnabled {
-                AgentModePerfDiagnostics.increment("provider.codex.commandRunning.enqueue", tabID: session.tabID)
+            if perfRecorder.isEnabled {
+                perfRecorder.increment("provider.codex.commandRunning.enqueue", tabID: session.tabID)
                 if didMerge {
-                    AgentModePerfDiagnostics.increment("provider.codex.commandRunning.merge", tabID: session.tabID)
+                    perfRecorder.increment("provider.codex.commandRunning.merge", tabID: session.tabID)
                 }
-                AgentModePerfDiagnostics.event(
+                perfRecorder.event(
                     "provider.codex.commandRunning.enqueue",
                     tabID: session.tabID,
                     fields: [
@@ -10229,7 +10421,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private func flushCommandExecutionRunningUpdates(session: AgentTabSession) {
         #if DEBUG
-            let diagnosticsStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let diagnosticsStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         session.pendingCommandRunningFlushTask?.cancel()
         session.pendingCommandRunningFlushTask = nil
@@ -10238,9 +10430,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let updates = Array(session.pendingCommandRunningByKey.values)
         session.pendingCommandRunningByKey.removeAll()
         #if DEBUG
-            if AgentModePerfDiagnostics.isEnabled {
-                AgentModePerfDiagnostics.increment("provider.codex.commandRunning.flush", tabID: session.tabID)
-                AgentModePerfDiagnostics.event(
+            if perfRecorder.isEnabled {
+                perfRecorder.increment("provider.codex.commandRunning.flush", tabID: session.tabID)
+                perfRecorder.event(
                     "provider.codex.commandRunning.flushStart",
                     tabID: session.tabID,
                     fields: ["batchSize": String(updates.count)]
@@ -10256,23 +10448,23 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         guard applyResult.didChange else {
             #if DEBUG
-                if AgentModePerfDiagnostics.isEnabled {
-                    AgentModePerfDiagnostics.increment("provider.codex.commandRunning.flushNoChange", tabID: session.tabID)
-                    AgentModePerfDiagnostics.event("provider.codex.commandRunning.flushNoChange", tabID: session.tabID, fields: ["batchSize": String(updates.count)])
+                if perfRecorder.isEnabled {
+                    perfRecorder.increment("provider.codex.commandRunning.flushNoChange", tabID: session.tabID)
+                    perfRecorder.event("provider.codex.commandRunning.flushNoChange", tabID: session.tabID, fields: ["batchSize": String(updates.count)])
                 }
             #endif
             return
         }
         #if DEBUG
-            if AgentModePerfDiagnostics.isEnabled {
-                AgentModePerfDiagnostics.increment("provider.codex.commandRunning.flushDidUpdate", tabID: session.tabID)
+            if perfRecorder.isEnabled {
+                perfRecorder.increment("provider.codex.commandRunning.flushDidUpdate", tabID: session.tabID)
                 if let diagnosticsStartMS {
-                    AgentModePerfDiagnostics.event(
+                    perfRecorder.event(
                         "provider.codex.commandRunning.flushComplete",
                         tabID: session.tabID,
                         fields: [
                             "batchSize": String(updates.count),
-                            "duration": AgentModePerfDiagnostics.formatElapsedMS(since: diagnosticsStartMS),
+                            "duration": perfRecorder.formatElapsedMS(since: diagnosticsStartMS),
                             "liveBash": String(session.bashLiveExecutionByKey.count)
                         ]
                     )

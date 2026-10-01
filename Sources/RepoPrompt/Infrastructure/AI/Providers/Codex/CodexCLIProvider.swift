@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptInstrumentation
+import RepoPromptProcess
 
 final class CodexCLIProvider: AIProvider {
     private struct StreamAttemptFailure: Error {
@@ -89,6 +91,7 @@ final class CodexCLIProvider: AIProvider {
     private let appServerReadyHook: (() async throws -> Void)?
     private let sessionControllerFactory: ((Set<String>, TimeInterval) -> CodexSessionControlling)?
     private let authRecovery: any CodexManagedAuthRecovering
+    private let perfRecorder: any AgentModePerfRecording
     private let initialBackoff: TimeInterval = 1.0
     private let maxBackoff: TimeInterval = 8.0
     private let reminderBlock = """
@@ -111,6 +114,7 @@ final class CodexCLIProvider: AIProvider {
         logCollector: CLIProcessLogCollector? = nil,
         appServerReadyHook: (() async throws -> Void)? = nil,
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
         sessionControllerFactory: ((Set<String>, TimeInterval) -> CodexSessionControlling)? = nil
     ) {
         self.workingDirectory = workingDirectory
@@ -125,6 +129,7 @@ final class CodexCLIProvider: AIProvider {
         self.maxRetries = maxRetries ?? 2
         self.appServerReadyHook = appServerReadyHook
         self.authRecovery = authRecovery
+        self.perfRecorder = perfRecorder
         self.sessionControllerFactory = sessionControllerFactory
         _ = logCollector
 
@@ -902,7 +907,7 @@ final class CodexCLIProvider: AIProvider {
         return AIProviderError.invalidConfiguration(detail: "Codex app-server timed out after \(seconds)s. Please try again shortly.")
     }
 
-    private func makeInteractiveSessionController(
+    func makeInteractiveSessionController(
         appServerClient: CodexAppServerClient?,
         excludeServers: Set<String>,
         requestTimeout: TimeInterval
@@ -928,7 +933,8 @@ final class CodexCLIProvider: AIProvider {
             options: options,
             // The transport is owned by the outer request lifecycle, not by the
             // single-turn controller.
-            clientShutdownBehavior: .none
+            clientShutdownBehavior: .none,
+            perfRecorder: perfRecorder
         )
     }
 

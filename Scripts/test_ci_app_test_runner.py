@@ -4,6 +4,10 @@
 from __future__ import annotations
 
 import io
+import hashlib
+import json
+import os
+import tarfile
 import subprocess
 import sys
 import tempfile
@@ -15,6 +19,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import ci_app_test_runner as runner  # noqa: E402
+import modularization_ci_artifact as artifact  # noqa: E402
+import swift_imports  # noqa: E402
 
 
 class InterpreterCompatibilityTests(unittest.TestCase):
@@ -28,6 +34,89 @@ class InterpreterCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Run deterministic RepoPrompt CE XCTest suites.", result.stdout)
+
+
+class HostedShardTests(unittest.TestCase):
+    def test_list_uses_skip_build_for_transferred_artifact(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, stdout='RepoPromptTests.ExampleTests/testOne\n')
+        with mock.patch.object(runner.subprocess, 'run', return_value=completed) as run:
+            found = runner.list_suite_methods('swift', Path('/checkout'), skip_build=True)
+        self.assertEqual(found, {'RepoPromptTests.ExampleTests': ('RepoPromptTests.ExampleTests/testOne',)})
+        self.assertEqual(run.call_args.args[0], ['swift', 'test', 'list', '--skip-build'])
+
+
+class TransferredBuildTests(unittest.TestCase):
+    def test_archive_contains_only_runnable_products_and_gate_attestations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'source'
+            copy = Path(temporary) / 'copy'
+            app = source / 'Sources/RepoPrompt/App'
+            app.mkdir(parents=True)
+            (app / 'Main.swift').write_text('struct Main {}\n')
+            test_source = source / 'Tests/RepoPromptTests/ExampleTests.swift'
+            test_source.parent.mkdir(parents=True)
+            test_source.write_text('import XCTest\n')
+            metadata = source / '.build/modularization'
+            metadata.mkdir(parents=True)
+            digest = hashlib.sha256((app / 'Main.swift').read_bytes()).hexdigest()
+            for name in ('app-source-sha256.json', 'index-check.json'):
+                (metadata / name).write_text(json.dumps({'source_sha256': {'App/Main.swift': digest}}))
+            (metadata / 'ci-test-list.txt').write_text('RepoPromptTests.ExampleTests/testOne\n')
+            (metadata / 'test-source-sha256.json').write_text(
+                json.dumps({'source_sha256': {'RepoPromptTests/ExampleTests.swift':
+                                             hashlib.sha256(test_source.read_bytes()).hexdigest()}}))
+            products = source / '.build/out/Products/Debug'
+            bundle = products / 'RepoPromptTests.xctest'
+            bundle.mkdir(parents=True)
+            (bundle / 'test-binary').write_bytes(b'test')
+            (bundle / 'alias').symlink_to('test-binary')
+            resource = products / 'Example.bundle'
+            resource.mkdir()
+            (resource / 'resource').write_bytes(b'data')
+            (products / 'unused.o').write_bytes(b'object')
+            for excluded in ('ModuleCache', 'RepoPromptApp.build', 'index/store'):
+                item = products / excluded
+                item.mkdir(parents=True)
+                (item / 'payload').write_bytes(b'intermediate')
+            checkout = source / '.build/checkouts/example'
+            checkout.mkdir(parents=True)
+            (checkout / 'source.swift').write_text('not transferred')
+            archive = Path(temporary) / 'build.tar.gz'
+            artifact.pack(source, archive)
+            (copy / 'Sources/RepoPrompt/App').mkdir(parents=True)
+            (copy / 'Sources/RepoPrompt/App/Main.swift').write_text('struct Main {}\n')
+            copied_test = copy / 'Tests/RepoPromptTests/ExampleTests.swift'
+            copied_test.parent.mkdir(parents=True)
+            copied_test.write_text('import XCTest\n')
+            with tarfile.open(archive, 'r:gz') as stream:
+                self.assertFalse(any('ModuleCache' in member.name or
+                                     'RepoPromptApp.build' in member.name or
+                                     'index/store' in member.name for member in stream.getmembers()))
+                stream.extractall(copy, filter='data')
+            self.assertTrue((copy / '.build/out/Products/Debug/RepoPromptTests.xctest/alias').is_symlink())
+            self.assertFalse((copy / '.build/out/Products/Debug/unused.o').exists())
+            self.assertFalse((copy / '.build/checkouts').exists())
+            self.assertIsNone(runner.verify_transferred_build(copy))
+            copied_test.write_text('import Testing\n')
+            self.assertIn('test sources do not match', runner.verify_transferred_build(copy))
+            (copy / '.build/modularization/test-source-sha256.json').write_text(
+                json.dumps({'source_sha256': {'RepoPromptTests/ExampleTests.swift':
+                                             hashlib.sha256(copied_test.read_bytes()).hexdigest()}}))
+            self.assertIn('cannot run Swift Testing', runner.verify_transferred_build(copy))
+            copied_test.write_text('import XCTest\n')
+            (copy / '.build/modularization/test-source-sha256.json').write_text(
+                json.dumps({'source_sha256': {'RepoPromptTests/ExampleTests.swift':
+                                             hashlib.sha256(copied_test.read_bytes()).hexdigest()}}))
+            discovered = runner.discover_test_bundles('swift', copy, prebuilt_bin_path=artifact.validate(copy))
+            self.assertIn('RepoPromptTests', discovered)
+            (copy / 'Sources/RepoPrompt/App/Main.swift').write_text('struct Other {}\n')
+            self.assertIn('do not match', runner.verify_transferred_build(copy))
+            (copy / 'Sources/RepoPrompt/App/Main.swift').write_text('struct Main {}\n')
+            (copy / '.build/modularization/index-check.json').unlink()
+            self.assertIn('metadata missing', runner.verify_transferred_build(copy))
+            (metadata / 'index-check.json').unlink()
+            with self.assertRaises(ValueError):
+                artifact.pack(source, archive)
 
 
 class LocalExecutionTests(unittest.TestCase):
@@ -94,6 +183,51 @@ class LocalExecutionTests(unittest.TestCase):
         ])
         self.assertIsNotNone(sandbox)
         self.assertFalse(sandbox.exists())
+
+    def test_measurement_scratch_and_build_args_reach_build_discovery_and_fallback(self) -> None:
+        executor = mock.Mock(return_value=0)
+        seen = {}
+
+        def direct(**kwargs):
+            seen.update(kwargs)
+            return None
+
+        scratch = Path("/r/.build/measure/x")
+        runner.run_local_tests(
+            swift_binary="swift", cwd=None, test_filter="S", executor=executor, direct_command=direct,
+            scratch_path=scratch, build_args=("-Xlinker", "-no_deduplicate"),
+        )
+        swiftpm = ("--scratch-path", str(scratch), "-Xlinker", "-no_deduplicate")
+        self.assertEqual(executor.call_args_list[0].args[0], ("swift", "build", "--build-tests", *swiftpm))
+        self.assertEqual(seen["scratch_path"], scratch)
+        self.assertEqual(executor.call_args_list[1].args[0], ("swift", "test", "--skip-build", *swiftpm, "--filter", "S"))
+
+    def test_measurement_build_args_require_scratch_path(self) -> None:
+        executor = mock.Mock(return_value=0)
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(runner.run_local_tests(
+                swift_binary="swift", cwd=None, executor=executor, build_args=("-Xlinker", "-x"),
+            ), 2)
+        executor.assert_not_called()
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            for argv in (
+                ["--local", "--build-arg=-Xlinker"],
+                ["--local", "--module", "XTests", "--scratch-path", "/s"],
+                ["--scratch-path", "/s"],
+            ):
+                with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                    runner.parse_args(argv)
+        parsed = runner.parse_args(["--local", "--scratch-path", "/s", "--build-arg=-Xswiftc", "--build-arg=-v"])
+        self.assertEqual(parsed.build_args, ["-Xswiftc", "-v"])
+
+    def test_discovery_uses_the_measurement_scratch_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = subprocess.CompletedProcess([], 0, stdout=f"{tmp}\n")
+            with mock.patch.object(runner.subprocess, "run", return_value=completed) as run:
+                runner.discover_test_bundles("swift", None, Path("/s"))
+                runner.discover_test_bundles("swift", None)
+        self.assertEqual(run.call_args_list[0].args[0], ["swift", "build", "--scratch-path", "/s", "--show-bin-path"])
+        self.assertEqual(run.call_args_list[1].args[0], ["swift", "build", "--show-bin-path"])
 
     def test_local_build_failure_does_not_launch_tests(self) -> None:
         executor = mock.Mock(return_value=9)
@@ -206,6 +340,232 @@ class DirectXCTestExecutionTests(unittest.TestCase):
             direct_command=lambda **kwargs: None,
         )
         self.assertEqual(executor.call_args_list[1].args[0], ("swift", "test", "--skip-build", "--filter", "S"))
+
+
+class ModuleExecutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        for module in ("RepoPromptMCPCoreTests", "XTests", "MixedTests", "OtherTests"):
+            (self.root / "Tests" / module).mkdir(parents=True)
+            (self.root / "Tests" / module / "A.swift").write_text("import XCTest\n")
+        (self.root / "Tests" / "MixedTests" / "B.swift").write_text("@testable import Lib\nimport Testing\n")
+
+    def run_mixed(self, *, statuses, listed=("MixedTests.XCSuite/testA",), test_filter="Suite", **overrides):
+        calls = []
+        results = list(statuses)
+
+        def execute(command, cwd, environment):
+            calls.append((tuple(command), dict(environment)))
+            return results.pop(0)
+
+        options = dict(
+            swift_binary="swift", cwd=self.root, module="MixedTests", test_filter=test_filter, executor=execute,
+            bundle_locator=lambda swift, cwd, module: Path("/b/MixedTests.xctest"),
+            lister=lambda bundle, env: list(listed),
+            xctest_binary=lambda: ("/x/xctest",),
+            testing_helper=lambda swift: Path("/tc/swiftpm-testing-helper"),
+            testing_environment=lambda env: {**env, "DYLD_FRAMEWORK_PATH": "/dev/Frameworks"},
+        )
+        options.update(overrides)
+        with mock.patch.dict(runner.os.environ, {"PATH": "/usr/bin", "HOME": "/real"}, clear=True), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            return runner.run_module_tests(**options), calls
+
+    def test_module_run_builds_only_its_product_and_runs_bundle(self) -> None:
+        calls = []
+
+        def execute(command, cwd, environment):
+            calls.append((tuple(command), environment.get("HOME")))
+            return 0
+
+        with mock.patch.dict(runner.os.environ, {"PATH": "/usr/bin", "HOME": "/real"}, clear=True):
+            result = runner.run_module_tests(
+                swift_binary="swift", cwd=self.root, module="RepoPromptMCPCoreTests", test_filter="CLIMode",
+                executor=execute,
+                bundle_locator=lambda swift, cwd, module: Path("/b/RepoPromptMCPCoreTests.xctest"),
+                lister=lambda bundle, env: ["RepoPromptMCPCoreTests.CLIModeParsingTests/testA"],
+                xctest_binary=lambda: ("/x/xctest",),
+                testing_helper=lambda swift: self.fail("XCTest-only targets must not look up Swift Testing"),
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], (("swift", "build", "--build-system", "swiftbuild", "--scratch-path",
+                                     ".build/swiftbuild", "--product", "RepoPromptMCPCoreTests"), "/real"))
+        self.assertEqual(calls[1][0], ("/x/xctest", "-XCTest", "RepoPromptMCPCoreTests.CLIModeParsingTests",
+                                       "/b/RepoPromptMCPCoreTests.xctest"))
+        self.assertIn("rpce-module-tests-", calls[1][1])
+
+    def test_module_run_rejects_non_test_targets_and_missing_bundles(self) -> None:
+        executor = mock.Mock(return_value=0)
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(runner.run_module_tests(swift_binary="swift", cwd=self.root, module="RepoPromptApp",
+                                                     executor=executor), 2)
+            self.assertEqual(runner.run_module_tests(swift_binary="swift", cwd=self.root, module="MissingTests",
+                                                     executor=executor), 2)
+            executor.assert_not_called()
+            self.assertEqual(runner.run_module_tests(swift_binary="swift", cwd=self.root, module="XTests",
+                                                     executor=executor,
+                                                     bundle_locator=lambda *a: None), 2)
+
+    def test_module_run_executes_swift_testing_like_swiftpm(self) -> None:
+        result, calls = self.run_mixed(statuses=[0, 0, 0])
+        self.assertEqual(result, 0)
+        self.assertEqual(calls[1][0], ("/x/xctest", "-XCTest", "MixedTests.XCSuite", "/b/MixedTests.xctest"))
+        binary = "/b/MixedTests.xctest/Contents/MacOS/MixedTests"
+        self.assertEqual(calls[2][0], (
+            "/tc/swiftpm-testing-helper", "--test-bundle-path", binary, "--build-system", "swiftbuild",
+            "--filter", "Suite", binary, "--testing-library", "swift-testing",
+        ))
+        self.assertIn("rpce-module-tests-", calls[2][1]["HOME"])
+        self.assertEqual(calls[2][1]["DYLD_FRAMEWORK_PATH"], "/dev/Frameworks")
+        self.assertEqual(calls[1][1]["SWIFT_TESTING_ENABLED"], "0", "xctest must not also host Swift Testing")
+        self.assertNotIn("SWIFT_TESTING_ENABLED", calls[2][1])
+
+    def test_module_run_swift_testing_exit_codes_match_swift_test(self) -> None:
+        self.assertEqual(self.run_mixed(statuses=[0, 0, runner.SWIFT_TESTING_NO_TESTS_EXIT])[0], 0)
+        self.assertEqual(self.run_mixed(statuses=[0, 0, 1])[0], 1)
+        result, calls = self.run_mixed(statuses=[0, 1, 0])
+        self.assertEqual(result, 1)
+        self.assertEqual(len(calls), 3, "Swift Testing still runs after an XCTest failure")
+
+    def test_module_run_without_xctest_matches_runs_only_swift_testing(self) -> None:
+        result, calls = self.run_mixed(statuses=[0, 0], listed=("MixedTests.Other/testA",))
+        self.assertEqual(result, 0)
+        self.assertEqual([call[0][0] for call in calls], ["swift", "/tc/swiftpm-testing-helper"])
+        result, calls = self.run_mixed(statuses=[0, 0], test_filter=None, listed=())
+        self.assertEqual(calls[1][0][-5:], ("--build-system", "swiftbuild",
+                                            "/b/MixedTests.xctest/Contents/MacOS/MixedTests",
+                                            "--testing-library", "swift-testing"))
+
+    def test_qualified_swift_testing_only_target_runs_failing_test(self) -> None:
+        (self.root / "Tests" / "MixedTests" / "B.swift").write_text(
+            "internal import Testing\n@Test func fails() { #expect(false) }\n"
+        )
+        for prefix in ("internal", "public", "@_exported"):
+            self.assertIn('Testing', swift_imports.imported_modules(f"{prefix} import Testing\n"))
+        result, calls = self.run_mixed(statuses=[0, 1], listed=(), test_filter=None)
+        self.assertEqual(result, 1)
+        self.assertEqual([call[0][0] for call in calls], ["swift", "/tc/swiftpm-testing-helper"])
+
+    def test_module_run_fails_closed_when_swift_testing_cannot_run_equivalently(self) -> None:
+        result, calls = self.run_mixed(statuses=[], testing_helper=lambda swift: None)
+        self.assertEqual((result, calls), (2, []))
+        result, calls = self.run_mixed(statuses=[0, 0], testing_environment=lambda env: None)
+        self.assertEqual(result, 2)
+        self.assertEqual(len(calls), 2)
+        result, calls = self.run_mixed(statuses=[], test_filter=r"Suite\d")
+        self.assertEqual((result, calls), (2, []))
+
+    def test_swift_testing_detection_is_scoped_to_the_module_and_shared_with_the_aggregate_path(self) -> None:
+        self.assertTrue(runner.sources_import_swift_testing(self.root / "Tests" / "MixedTests"))
+        self.assertFalse(runner.sources_import_swift_testing(self.root / "Tests" / "OtherTests"))
+        self.assertFalse(runner.sources_import_swift_testing(self.root / "Tests" / "MissingTests"))
+        self.assertTrue(runner.package_uses_swift_testing(self.root))
+        with mock.patch.object(runner, "sources_import_swift_testing", return_value=False) as shared:
+            self.assertFalse(runner.package_uses_swift_testing(self.root))
+        shared.assert_called_once_with(self.root / "Tests")
+
+    def test_portable_filters(self) -> None:
+        for portable in ("RepoPromptDomainRuntimeTests", "Alpha|Beta", "^Mod\\.Suite/test(One|Two)$",
+                         "test[A-Z]x", "a.*b+c?", "inSuite\\(\\)"):
+            self.assertTrue(runner.is_portable_filter(portable), portable)
+        for unportable in ("\\d", "\\QA\\E", "(?i)abc", "(?=a)", "a{2}", "[[a]]", "[a&&b]", "[a--b]", "[]a]",
+                           "[^]a]", "(unclosed", "[open", "trailing\\"):
+            self.assertFalse(runner.is_portable_filter(unportable), unportable)
+        self.assertIsNone(runner.select_xctest_specifiers(["M.S/testA"], "test\\w"))
+
+    def test_developer_library_environment_prepends_platform_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as platform:
+            (Path(platform) / "Developer").mkdir()
+            completed = subprocess.CompletedProcess([], 0, stdout=f"{platform}\n")
+            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+                environment = runner.developer_library_environment({"HOME": "/h", "DYLD_LIBRARY_PATH": "/mine"})
+        developer = f"{platform}/Developer"
+        self.assertEqual(environment["DYLD_FRAMEWORK_PATH"],
+                         f"{developer}/Library/Frameworks:{developer}/Library/PrivateFrameworks")
+        self.assertEqual(environment["DYLD_LIBRARY_PATH"], f"{developer}/usr/lib:/mine")
+        self.assertEqual(environment["HOME"], "/h")
+        with mock.patch.object(runner.subprocess, "run", side_effect=OSError):
+            self.assertIsNone(runner.developer_library_environment({}))
+
+    def test_conductor_forwards_module_and_skips_build_cache(self) -> None:
+        import conductor
+
+        argv, lanes, _, _, _ = conductor.OperationRegistry(SCRIPT_DIR.parent).prepare({
+            "operation": "test", "args": {"module": "RepoPromptMCPCoreTests", "filter": "X"},
+        })
+        self.assertEqual(argv[2:], ["--local", "--module", "RepoPromptMCPCoreTests", "--filter", "X"])
+        self.assertEqual(lanes, ["build"])
+        self.assertFalse(conductor.BuildCacheManager.eligible("test", {"module": "RepoPromptMCPCoreTests"}))
+        self.assertTrue(conductor.BuildCacheManager.eligible("test", {}))
+
+    def test_conductor_measurement_builds_use_a_separate_scratch_path(self) -> None:
+        import conductor
+
+        root = SCRIPT_DIR.parent
+        registry = conductor.OperationRegistry(root)
+        scratch = str(root / ".build" / "measure" / "p05")
+        argv, lanes, _, _, _ = registry.prepare({"operation": "swift-build", "args": {
+            "product": "RepoPrompt", "scratch": "p05",
+            "swiftcFlags": ["-Xfrontend", "-warn-long-function-bodies=200"], "linkerFlags": ["-no_deduplicate"],
+        }})
+        self.assertEqual(argv, [
+            "swift", "build", "--product", "RepoPrompt", "--scratch-path", scratch,
+            "-Xswiftc", "-Xfrontend", "-Xswiftc", "-warn-long-function-bodies=200", "-Xlinker", "-no_deduplicate",
+        ])
+        self.assertEqual(lanes, ["build"])
+        argv, _, _, _, _ = registry.prepare({"operation": "test", "args": {
+            "filter": "X", "scratch": "p05", "linkerFlags": ["-no_deduplicate"],
+        }})
+        self.assertEqual(argv[2:], [
+            "--local", "--scratch-path", scratch, "--build-arg=-Xlinker", "--build-arg=-no_deduplicate", "--filter", "X",
+        ])
+        plain, _, _, _, _ = registry.prepare({"operation": "swift-build", "args": {"product": "RepoPrompt"}})
+        self.assertEqual(plain, ["swift", "build", "--product", "RepoPrompt"])
+        self.assertFalse(conductor.BuildCacheManager.eligible("swift-build", {"product": "RepoPrompt", "scratch": "p05"}))
+        self.assertFalse(conductor.BuildCacheManager.eligible("test", {"scratch": "p05"}))
+
+    def test_conductor_rejects_unsafe_measurement_requests(self) -> None:
+        import conductor
+
+        registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
+        rejected = (
+            ("swift-build", {"product": "RepoPrompt", "swiftcFlags": ["-v"]}),
+            ("test", {"linkerFlags": ["-no_deduplicate"]}),
+            ("swift-build", {"product": "all", "scratch": "p05"}),
+            ("test", {"module": "RepoPromptMCPCoreTests", "scratch": "p05"}),
+            ("swift-build", {"product": "RepoPrompt", "scratch": "../escape"}),
+            ("swift-build", {"product": "RepoPrompt", "scratch": "a/b"}),
+        )
+        for operation, args in rejected:
+            with self.subTest(operation=operation, args=args), self.assertRaises(conductor.ConductorError):
+                registry.prepare({"operation": operation, "args": args})
+
+    def test_seed_sanitizing_drops_measurement_scratch(self) -> None:
+        import conductor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp) / ".build"
+            (build / "measure" / "p05").mkdir(parents=True)
+            (build / "measure" / "p05" / "build.db").write_text("x")
+            (build / "debug").mkdir()
+            conductor.BuildCacheManager._sanitize_seed(build)
+            self.assertFalse((build / "measure").exists())
+            self.assertTrue((build / "debug").is_dir())
+
+    def test_seed_sanitizing_drops_module_test_scratch(self) -> None:
+        import conductor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp) / ".build"
+            (build / "swiftbuild" / "arm64-apple-macosx").mkdir(parents=True)
+            (build / "swiftbuild" / "arm64-apple-macosx" / "build.db").write_text("x")
+            (build / "debug").mkdir()
+            conductor.BuildCacheManager._sanitize_seed(build)
+            self.assertFalse((build / "swiftbuild").exists())
+            self.assertTrue((build / "debug").is_dir())
 
 
 class TestDiscoveryTests(unittest.TestCase):

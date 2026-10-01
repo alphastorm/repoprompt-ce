@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptC
+import RepoPromptWorkspaceCore
 
 /// Define size_t for C interop
 typealias size_t = Int

@@ -1,6 +1,9 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptWorkspaceCore
 import SwiftUI
 #if DEBUG || EDIT_FLOW_PERF
     import os
@@ -1276,6 +1279,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     private let automaticCodemapSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter
     private let automaticCodemapReadinessRetryDelay: Duration
     private let defaultApplicationOpener: DefaultApplicationOpener
+    let restorePerfRecorder: any WorkspaceRestorePerfRecording
 
     init(
         alwaysReadableHomeDirectoryURL: URL? = nil,
@@ -1289,8 +1293,10 @@ class WorkspaceFilesViewModel: ObservableObject {
         ),
         automaticCodemapSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter = .production,
         automaticCodemapReadinessRetryDelay: Duration = .milliseconds(400),
-        defaultApplicationOpener: DefaultApplicationOpener = .system
+        defaultApplicationOpener: DefaultApplicationOpener = .system,
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
     ) {
+        self.restorePerfRecorder = restorePerfRecorder
         self.alwaysReadableHomeDirectoryURL = (alwaysReadableHomeDirectoryURL ?? FileManager.default.homeDirectoryForCurrentUser).standardizedFileURL
         self.workspaceFileContextStore = workspaceFileContextStore
         self.automaticCodemapSelectionRequestPolicy = automaticCodemapSelectionRequestPolicy
@@ -1449,7 +1455,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     private func handleWorkspaceSwitch(to workspace: WorkspaceModel?) async {
         #if DEBUG
-            let switchSlicesStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let switchSlicesStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         currentWorkspaceID = workspace?.id
         currentTabID = nil
@@ -1457,10 +1463,10 @@ class WorkspaceFilesViewModel: ObservableObject {
             currentSlicesByRoot.removeAll()
             requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "workspaceFiles.workspaceSwitchSlices.clear",
                     fields: [
-                        "duration": switchSlicesStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": switchSlicesStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -1468,10 +1474,10 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
 
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "workspaceFiles.workspaceSwitchSlices.begin",
                 fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspaceID),
+                    "workspaceID": restorePerfRecorder.shortID(workspaceID),
                     "rootCount": "\(rootFolders.count)"
                 ]
             )
@@ -1490,13 +1496,13 @@ class WorkspaceFilesViewModel: ObservableObject {
         currentSlicesByRoot = refreshed
         requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "workspaceFiles.workspaceSwitchSlices.end",
                 fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspaceID),
+                    "workspaceID": restorePerfRecorder.shortID(workspaceID),
                     "rootCount": "\(rootFolders.count)",
                     "rootsWithSlices": "\(refreshed.count)",
-                    "duration": switchSlicesStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": switchSlicesStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -2734,14 +2740,14 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func restoreExpansionState(from paths: [String]) async {
         #if DEBUG
-            let restoreExpansionStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let restoreExpansionStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var restoreExpansionOutcome = "completed"
             var restoreExpansionTargetFolders = 0
             var restoreExpansionCollapseCount = 0
             var restoreExpansionExpandCount = 0
             var restoreExpansionDidChange = false
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.restoreExpansion",
                     fields: [
                         "requestedPaths": "\(paths.count)",
@@ -2751,7 +2757,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                         "expandCount": "\(restoreExpansionExpandCount)",
                         "didChange": "\(restoreExpansionDidChange)",
                         "outcome": restoreExpansionOutcome,
-                        "duration": restoreExpansionStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": restoreExpansionStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -3018,7 +3024,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         // Use stable string key for root/service mirrors (avoids URL key instability)
         let rootKey = rootKey(forPath: url.path)
         #if DEBUG
-            let loadFolderTotalStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let loadFolderTotalStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let restorePerfRootKind = restorePerfRootKindName(rootKind)
             let restorePerfRootName = url.lastPathComponent
         #endif
@@ -3035,14 +3041,14 @@ class WorkspaceFilesViewModel: ObservableObject {
             workspaceFilesDebugLog("Root shell already loaded: \(url.path)")
             isLoading = false
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "folderLoad.total",
                     fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                        "workspaceID": restorePerfRecorder.shortID(workspace.id),
                         "rootKind": restorePerfRootKind,
                         "rootName": restorePerfRootName,
                         "outcome": "alreadyLoaded",
-                        "duration": loadFolderTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": loadFolderTotalStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -3067,7 +3073,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 try validateRootLoadToken(loadToken)
 
                 #if DEBUG
-                    let storeLoadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                    let storeLoadStartMS = restorePerfRecorder.timestampMSIfEnabled()
                 #endif
                 let workspaceRootRecord = try await workspaceFileContextStore.loadRoot(
                     path: rootPath,
@@ -3080,16 +3086,16 @@ class WorkspaceFilesViewModel: ObservableObject {
                     cancelUnderlyingLoadOnCallerCancellation: true
                 )
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "folderLoad.storeLoad",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "rootKind": restorePerfRootKind,
                             "rootName": restorePerfRootName,
-                            "rootID": WorkspaceRestorePerfLog.shortID(workspaceRootRecord.id),
+                            "rootID": restorePerfRecorder.shortID(workspaceRootRecord.id),
                             "wasPreloadedCandidate": "\(preloadedWorkspaceFileContextRootsByRootKey[rootKey] != nil)",
                             "outcome": "success",
-                            "duration": storeLoadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": storeLoadStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                 #endif
@@ -3097,7 +3103,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 try validateRootLoadToken(loadToken)
 
                 #if DEBUG
-                    let rootVMInitStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                    let rootVMInitStartMS = restorePerfRecorder.timestampMSIfEnabled()
                 #endif
                 let rootShellAttachment: RootShellAttachment
                 do {
@@ -3120,13 +3126,13 @@ class WorkspaceFilesViewModel: ObservableObject {
                     appendedRootFolder = rootFolderVM
                 }
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "folderLoad.rootShellAttach",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "rootKind": restorePerfRootKind,
                             "rootName": restorePerfRootName,
-                            "duration": rootVMInitStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": rootVMInitStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                     if let rootLoadDidAttachRootShellHandler {
@@ -3152,14 +3158,14 @@ class WorkspaceFilesViewModel: ObservableObject {
                 folderBeingAdded = nil
                 folderDidFinishLoadingPublisher.send(rootFolderVM)
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "folderLoad.total",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "rootKind": restorePerfRootKind,
                             "rootName": restorePerfRootName,
                             "outcome": "success",
-                            "duration": loadFolderTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": loadFolderTotalStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                 #endif
@@ -3180,14 +3186,14 @@ class WorkspaceFilesViewModel: ObservableObject {
                     folderBeingAdded = nil
                     folderDidFinishLoadingPublisher.send(attachedRootFolder)
                     #if DEBUG
-                        WorkspaceRestorePerfLog.event(
+                        restorePerfRecorder.event(
                             "folderLoad.total",
                             fields: [
-                                "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                                "workspaceID": restorePerfRecorder.shortID(workspace.id),
                                 "rootKind": restorePerfRootKind,
                                 "rootName": restorePerfRootName,
                                 "outcome": "watcherErrorRetained",
-                                "duration": loadFolderTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                                "duration": loadFolderTotalStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                             ]
                         )
                     #endif
@@ -3242,14 +3248,14 @@ class WorkspaceFilesViewModel: ObservableObject {
                 }
 
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "folderLoad.total",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "rootKind": restorePerfRootKind,
                             "rootName": restorePerfRootName,
                             "outcome": error is CancellationError ? "cancelled" : "error",
-                            "duration": loadFolderTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": loadFolderTotalStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                 #endif
@@ -9594,7 +9600,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         #if DEBUG
             let currentSlicesAfter = sliceStoreCounts(currentSlicesByRoot)
             let projectionRangeCount = projection.values.reduce(0) { $0 + $1.count }
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "selection.applyStoredSelection.sliceMirror",
                 fields: [
                     "requestedSliceFiles": "\(requestedSlices.count)",
@@ -9606,7 +9612,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                     "projectionAfterFiles": "\(projection.count)",
                     "projectionAfterRanges": "\(projectionRangeCount)",
                     "selectedFiles": "\(selectedFiles.count)",
-                    "currentTabID": WorkspaceRestorePerfLog.shortID(currentTabID)
+                    "currentTabID": restorePerfRecorder.shortID(currentTabID)
                 ]
             )
         #endif
@@ -9625,7 +9631,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func hydrateSlicesForActiveTab(from tabSelection: StoredSelection) async {
         #if DEBUG
-            let hydrateSlicesStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let hydrateSlicesStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var hydrateSlicesOutcome = "completed"
             var hydrateSlicesRootCount = rootFolders.count
             var hydrateSlicesRequestedFiles = tabSelection.slices.count
@@ -9634,7 +9640,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             var hydrateSlicesPendingPersistRoots = 0
             var hydrateSlicesPendingPersistFiles = 0
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.hydrateSlices",
                     fields: [
                         "rootCount": "\(hydrateSlicesRootCount)",
@@ -9644,7 +9650,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                         "pendingPersistRoots": "\(hydrateSlicesPendingPersistRoots)",
                         "pendingPersistFiles": "\(hydrateSlicesPendingPersistFiles)",
                         "outcome": hydrateSlicesOutcome,
-                        "duration": hydrateSlicesStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": hydrateSlicesStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -9788,16 +9794,16 @@ class WorkspaceFilesViewModel: ObservableObject {
         scope: PartitionScope
     ) async {
         #if DEBUG
-            let applySlicesSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let applySlicesSnapshotStartMS = restorePerfRecorder.timestampMSIfEnabled()
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.applySlicesSnapshot",
                     fields: [
                         "rootCount": "\(snapshot.count)",
                         "snapshotFiles": "\(snapshot.values.reduce(0) { $0 + $1.count })",
                         "pendingPersistRoots": "\(pendingPersist.count)",
                         "pendingPersistFiles": "\(pendingPersist.values.reduce(0) { $0 + $1.count })",
-                        "duration": applySlicesSnapshotStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": applySlicesSnapshotStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -9828,17 +9834,17 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func onActiveTabChangedFast(_ tab: ComposeTabState) {
         #if DEBUG
-            let activeTabFastStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let activeTabFastStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         setActiveTabID(tab.id)
         selectionSlicesByFileID.removeAll()
         requestSelectionSliceSnapshotRebuild(reason: "activeTabChanged.fast")
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "selection.activeTabChanged.fast",
                 fields: [
-                    "tabID": WorkspaceRestorePerfLog.shortID(tab.id),
-                    "duration": activeTabFastStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "tabID": restorePerfRecorder.shortID(tab.id),
+                    "duration": activeTabFastStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -9850,17 +9856,17 @@ class WorkspaceFilesViewModel: ObservableObject {
         selection: StoredSelection
     ) async {
         #if DEBUG
-            let activeTabHeavyStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let activeTabHeavyStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var activeTabHeavyOutcome = "completed"
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.activeTabChanged.heavy",
                     fields: [
-                        "tabID": WorkspaceRestorePerfLog.shortID(tabID),
+                        "tabID": restorePerfRecorder.shortID(tabID),
                         "selectedPaths": "\(selection.selectedPaths.count)",
                         "sliceFiles": "\(selection.slices.count)",
                         "outcome": activeTabHeavyOutcome,
-                        "duration": activeTabHeavyStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": activeTabHeavyStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -10335,7 +10341,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             sliceSnapshotRebuildPending = true
             #if DEBUG
                 sliceSnapshotRebuildPendingReasons.insert(reason)
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.rebuildSlicesSnapshot",
                     fields: [
                         "mode": "deferredRequest",
@@ -10380,10 +10386,10 @@ class WorkspaceFilesViewModel: ObservableObject {
         pendingReasons: Set<String>
     ) {
         #if DEBUG
-            let rebuildStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let rebuildStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var snapshotFiles = 0
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.rebuildSlicesSnapshot",
                     fields: [
                         "mode": mode,
@@ -10391,7 +10397,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                         "pendingReasons": pendingReasons.sorted().joined(separator: ","),
                         "selectedFiles": "\(selectedFiles.count)",
                         "snapshotFiles": "\(snapshotFiles)",
-                        "duration": rebuildStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": rebuildStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -11669,19 +11675,19 @@ extension WorkspaceFilesViewModel {
     @MainActor
     func applyStoredSelection(_ stored: StoredSelection) async {
         #if DEBUG
-            let applyStoredSelectionStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let applyStoredSelectionStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var applySelectionSnapshotDuration = "notMeasured"
         #endif
         autoCodemapSyncTask?.cancel()
         codemapAutoEnabled = false
 
         #if DEBUG
-            let applySelectionSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let applySelectionSnapshotStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         await applySelectionSnapshot(paths: stored.selectedPaths, allowEmpty: true)
         #if DEBUG
-            applySelectionSnapshotDuration = applySelectionSnapshotStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
-            WorkspaceRestorePerfLog.event(
+            applySelectionSnapshotDuration = applySelectionSnapshotStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
+            restorePerfRecorder.event(
                 "selection.applyStoredSelection.selectionSnapshot",
                 fields: [
                     "selectedPaths": "\(stored.selectedPaths.count)",
@@ -11722,14 +11728,14 @@ extension WorkspaceFilesViewModel {
             scheduleAutoCodemapSync()
         }
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "selection.applyStoredSelection",
                 fields: [
                     "selectedPaths": "\(stored.selectedPaths.count)",
                     "sliceFiles": "\(stored.slices.count)",
                     "codemapAutoEnabled": "\(stored.codemapAutoEnabled)",
                     "selectionSnapshotDuration": applySelectionSnapshotDuration,
-                    "duration": applyStoredSelectionStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": applyStoredSelectionStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif

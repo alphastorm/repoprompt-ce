@@ -66,7 +66,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
                 modelContextWindow: usage?.window
             )
         }
-        return AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID))
+        return AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID), subagentCounts: (running: 0, finished: 0))
     }
 
     func testClaudeSessionWithKnownUsagePublishesExactContextLoad() throws {
@@ -87,7 +87,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         fallback.contextUsageSnapshot = usage(40000, nil, confidence: .bestEffort)
         fallback.noteLiveContextUsageReport(contextUsedTokens: nil, promptTokens: 40000, modelContextWindow: nil)
         let partial = try XCTUnwrap(
-            AgentModeViewModel.observationSnapshot(for: fallback, candidate: makeCandidate(tabID: tabID)).context
+            AgentModeViewModel.observationSnapshot(for: fallback, candidate: makeCandidate(tabID: tabID), subagentCounts: (running: 0, finished: 0)).context
         )
         XCTAssertEqual(partial.confidence, .bestEffort)
         XCTAssertEqual(partial.usedTokens, 40000)
@@ -150,7 +150,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .claudeCode
         XCTAssertTrue(viewModel.ingestNonCodexUsageReport(
@@ -199,7 +199,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .claudeCode
         _ = viewModel.ingestNonCodexUsageReport(
@@ -240,7 +240,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .claudeCode
         _ = viewModel.ingestNonCodexUsageReport(
@@ -277,7 +277,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .claudeCode
         session.activeNonCodexTurnTokenAccumulator = AgentModeViewModel.NonCodexTurnTokenAccumulator()
@@ -307,7 +307,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .claudeCode
         _ = viewModel.ingestNonCodexUsageReport(
@@ -349,7 +349,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .claudeCode
         _ = viewModel.ingestNonCodexUsageReport(
@@ -379,7 +379,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             AgentContextUsage(modelContextWindow: 1_000_000, lastTotalTokens: 400_000, totalTotalTokens: 900_000),
             session: session
         )
-        let context = try XCTUnwrap(AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context)
+        let context = try XCTUnwrap(AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context)
         XCTAssertEqual(context.usedTokens, 400_000, "The last request's context, never the cumulative total")
         XCTAssertEqual(context.windowTokens, 1_000_000)
         XCTAssertEqual(context.usedPercent, 40.0)
@@ -389,7 +389,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         // from the pre-compaction figures.
         session.contextCompactedAt = Date()
         viewModel.refreshCodexContextUsageSnapshot(for: session)
-        let compacted = AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+        let compacted = AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         XCTAssertNil(compacted?.usedTokens)
         XCTAssertEqual(compacted?.windowTokens, 1_000_000)
     }
@@ -422,7 +422,8 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 200_000, "\(agent): the ring's window")
 
             let context = AgentModeViewModel.observationSnapshot(
-                for: session, candidate: makeCandidate(tabID: tabID)
+                for: session, candidate: makeCandidate(tabID: tabID),
+                subagentCounts: (running: 0, finished: 0)
             ).context
             XCTAssertEqual(context?.usedTokens, 90000, "\(agent)")
             XCTAssertEqual(context?.windowTokens, 200_000, "\(agent)")
@@ -443,7 +444,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             modelContextWindow: 272_000, session: session
         )
         let context = try XCTUnwrap(
-            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID)).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID), subagentCounts: (running: 0, finished: 0)).context
         )
         XCTAssertNil(context.usedTokens)
         XCTAssertEqual(context.windowTokens, 272_000)
@@ -459,7 +460,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .grokBuild
 
@@ -485,7 +486,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .devin
 
@@ -521,7 +522,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .devin
 
@@ -549,7 +550,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .grokBuild
 
@@ -593,7 +594,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .devin
 
@@ -625,7 +626,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .devin
 
@@ -658,7 +659,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .devin
 
@@ -685,7 +686,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .devin
 
@@ -715,7 +716,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .devin
 
@@ -742,7 +743,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .devin
 
@@ -772,7 +773,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .openCode
 
@@ -797,7 +798,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .openCode
 
@@ -827,7 +828,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         session.selectedAgent = .cursor
         XCTAssertNil(
-            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID)).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID), subagentCounts: (running: 0, finished: 0)).context
         )
         XCTAssertNil(session.contextUsageSnapshot)
         XCTAssertNil(session.codexContextUsage)
@@ -841,7 +842,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .claudeCode
         _ = viewModel.ingestNonCodexUsageReport(
@@ -931,7 +932,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         )
 
         let context = try XCTUnwrap(
-            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID)).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID), subagentCounts: (running: 0, finished: 0)).context
         )
         XCTAssertEqual(context.usedTokens, 152_500)
         XCTAssertEqual(context.windowTokens, 200_000)
@@ -958,7 +959,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNil(session.contextUsageSnapshot?.used)
         XCTAssertNil(session.vouchedContextCount)
         let context = try XCTUnwrap(
-            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID)).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID), subagentCounts: (running: 0, finished: 0)).context
         )
         XCTAssertNil(context.usedTokens)
         XCTAssertEqual(context.windowTokens, 200_000)
@@ -1024,7 +1025,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         session.noteLiveContextUsageReport(contextUsedTokens: 40000, promptTokens: nil, modelContextWindow: nil)
 
         let context = try XCTUnwrap(
-            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID)).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID), subagentCounts: (running: 0, finished: 0)).context
         )
         XCTAssertEqual(context.confidence, .exact)
         XCTAssertEqual(signals, 1)
@@ -1088,7 +1089,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         )
 
         let context = try XCTUnwrap(
-            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID)).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID), subagentCounts: (running: 0, finished: 0)).context
         )
         XCTAssertEqual(context.usedTokens, 100_000)
         XCTAssertEqual(context.confidence, .exact)
@@ -1102,7 +1103,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         let candidate = makeCandidate(tabID: tabID)
         func reported() -> DomainAgentSessionContextLoad? {
-            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .grokBuild
         var signals = 0

@@ -1,6 +1,7 @@
 import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
+import RepoPromptProcess
 
 enum CodexJSONValue: Equatable {
     case string(String)
@@ -474,7 +475,7 @@ actor CodexAppServerClient {
         launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
         provisionsRepoPromptMCPOnStart: Bool = true,
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
-            ChildProcessExitObserver(pid: $0)
+            ChildProcessExitObserver.observe(pid: $0)
         },
         expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar = .serverNetworkManager,
         faultInjection: FaultInjection = .init()

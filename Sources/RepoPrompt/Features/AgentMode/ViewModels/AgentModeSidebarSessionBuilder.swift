@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptInstrumentation
 
 @MainActor
 struct AgentModeSidebarSessionBuilder {
@@ -14,6 +15,7 @@ struct AgentModeSidebarSessionBuilder {
     let sessionListCacheReady: Bool
     let sidebarRestoreFrozenOrderByTabID: [UUID: Int]
     let mcpControlledTabIDs: Set<UUID>
+    var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
 
     private struct BuildContext {
         let tabByID: [UUID: ComposeTabState]
@@ -28,7 +30,7 @@ struct AgentModeSidebarSessionBuilder {
 
     func build() -> [SidebarSession] {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let context = makeBuildContext()
         let rows = rowTabs.map { tab in
@@ -39,7 +41,7 @@ struct AgentModeSidebarSessionBuilder {
         #if DEBUG
             let hasParentMetadata = sessions.values.contains { $0.parentSessionID != nil }
                 || sessionIndex.values.contains { $0.parentSessionID != nil }
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "sidebar.builder.build",
                 startMS: startMS,
                 fields: [
@@ -243,6 +245,7 @@ struct AgentModeSidebarSessionBuilder {
             periodicIdleWakeEnabled: entry.periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: entry.periodicIdleWakeIntervalSeconds,
             parentSessionID: entry.parentSessionID,
+            createdByOverseerSessionID: entry.createdByOverseerSessionID,
             hasUnknownConversationContent: entry.hasUnknownConversationContent,
             isMCPOriginated: entry.isMCPOriginated,
             worktreeBindingSummaries: entry.worktreeBindingSummaries,
@@ -323,6 +326,7 @@ struct AgentModeSidebarSessionBuilder {
             sessionID: resolvedSessionID,
             canStash: canStash,
             parentSessionID: resolvedParentSessionID,
+            createdByOverseerSessionID: metadataLiveSession?.createdByOverseerSessionID ?? entry?.createdByOverseerSessionID,
             depth: 0,
             isMCPControlled: isMCPControlled,
             worktree: worktree,
@@ -840,6 +844,7 @@ struct AgentModeSidebarSessionBuilder {
             sessionID: session.sessionID,
             canStash: session.canStash,
             parentSessionID: session.parentSessionID,
+            createdByOverseerSessionID: session.createdByOverseerSessionID,
             depth: depth,
             isMCPControlled: session.isMCPControlled,
             worktree: session.worktree,

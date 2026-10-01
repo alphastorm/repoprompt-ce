@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptProcess
 
 final actor ClaudeNativeProcessSessionController {
     private static let rawEventLogFilePathKey = "claudeRawEventLogFilePath"

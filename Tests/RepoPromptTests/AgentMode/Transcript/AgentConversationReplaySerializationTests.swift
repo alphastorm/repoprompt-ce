@@ -1,8 +1,86 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptInstrumentation
 import XCTest
 
 final class AgentConversationReplaySerializationTests: XCTestCase {
+    private final class ReplayPerfRecorder: AgentModePerfRecording, @unchecked Sendable {
+        private let lock = NSLock()
+        private let fallback = NoopAgentModePerfRecorder()
+        private var replayEvent: AgentPerfConversationReplayEvent?
+        private var selectedEvent: (String, [String: String])?
+
+        var isEnabled: Bool {
+            true
+        }
+
+        func timestampMSIfEnabled() -> Double? {
+            1
+        }
+
+        func timestampMS() -> Double {
+            fallback.timestampMS()
+        }
+
+        func elapsedMS(since startMS: Double) -> Double {
+            fallback.elapsedMS(since: startMS)
+        }
+
+        func formatMS(_ value: Double) -> String {
+            fallback.formatMS(value)
+        }
+
+        func formatElapsedMS(since startMS: Double) -> String {
+            fallback.formatElapsedMS(since: startMS)
+        }
+
+        func shortID(_ id: UUID?) -> String {
+            fallback.shortID(id)
+        }
+
+        func counterKey(_ base: String, source: String?) -> String {
+            fallback.counterKey(base, source: source)
+        }
+
+        func increment(_: String, tabID _: UUID?, by _: Int) {}
+        func event(_ name: String, tabID _: UUID?, fields: [String: String]) {
+            lock.lock()
+            selectedEvent = (name, fields)
+            lock.unlock()
+        }
+
+        func durationEvent(_: String, startMS _: Double?, tabID _: UUID?, fields _: [String: String]) {}
+        func recordStoreUpdate(_: String, published _: Bool, details _: [String: String]) {}
+        func recordConversationReplay(_ event: AgentPerfConversationReplayEvent, startMS _: Double?) {
+            lock.lock()
+            replayEvent = event
+            lock.unlock()
+        }
+
+        func beginSidebarDelete(_: AgentPerfSidebarDeleteBeginContext) -> UUID {
+            UUID()
+        }
+
+        func markSidebarDeleteVisibleRemoved(tabID _: UUID, source _: String, fields _: [String: String]) {}
+        func markSidebarDeleteAgentCleanupComplete(tabID _: UUID, source _: String, fields _: [String: String]) {}
+        func markSidebarDeleteFullCleanupComplete(tabID _: UUID, source _: String, fields _: [String: String]) {}
+        func cancelSidebarDeleteTracking(tabID _: UUID, source _: String, fields _: [String: String]) {}
+        func recordSessionSnapshot(tabID _: UUID, fields _: [String: AgentPerfSnapshotValue]) {}
+        func recordCodexLifecyclePhase(
+            _: AgentPerfCodexLifecyclePhase,
+            outcome _: AgentPerfCodexLifecycleOutcome,
+            startMS _: Double?,
+            tabID _: UUID,
+            transportGeneration _: UInt64?
+        ) {}
+
+        func snapshot() -> (AgentPerfConversationReplayEvent?, (String, [String: String])?) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (replayEvent, selectedEvent)
+        }
+    }
+
     func testEquivalentModeMatchesLegacyBytesAndCategoryMetrics() throws {
         let invocationID = try XCTUnwrap(UUID(uuidString: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"))
         let items: [AgentChatItem] = [
@@ -42,6 +120,17 @@ final class AgentConversationReplaySerializationTests: XCTestCase {
         XCTAssertEqual(serialization.text, expected)
         XCTAssertEqual(Array(serialization.text.utf8), Array(expected.utf8))
         XCTAssertEqual(AgentTranscriptIO.buildConversationHistory(from: transcript), expected)
+        let recorder = ReplayPerfRecorder()
+        XCTAssertEqual(AgentTranscriptIO.buildConversationHistory(from: transcript, perfRecorder: recorder), expected)
+        let replay = try XCTUnwrap(recorder.snapshot().0)
+        XCTAssertEqual(replay.mode, "equivalent")
+        XCTAssertEqual(replay.fields["toolResult.emitted"], "1")
+        XCTAssertEqual(replay.fields["truncatedToolCallCount"], "0")
+        XCTAssertFalse(replay.fields.values.contains { $0.contains("ignored by replay") || $0.contains("Sources/Ünicode.swift") })
+        AgentSelectedFilesDiagnostics(perfRecorder: recorder).event("test.aggregate", fields: ["count": "1"])
+        let selected = try XCTUnwrap(recorder.snapshot().1)
+        XCTAssertEqual(selected.0, "selectedFiles.test.aggregate")
+        XCTAssertEqual(selected.1, ["count": "1"])
         XCTAssertEqual(serialization.metrics.mode, .equivalent)
         XCTAssertEqual(serialization.metrics.outputUTF8Bytes, expected.utf8.count)
         XCTAssertEqual(serialization.metrics.unboundedOutputUTF8Bytes, expected.utf8.count)

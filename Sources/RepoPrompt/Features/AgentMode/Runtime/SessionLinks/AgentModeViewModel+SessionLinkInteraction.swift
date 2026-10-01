@@ -20,8 +20,14 @@ extension AgentModeViewModel {
         guard let session = agentSessionLinkLiveSession(matching: candidate),
               let interaction = mcpPendingInteraction(for: session)
         else { return .none }
+        if AgentSessionLinkPendingInteractionInspection.rawPromptExceedsWorkLimit(interaction) {
+            return .tooLarge(interaction)
+        }
         return AgentSessionLinkPendingInteractionInspection(
-            interaction: Self.overseerProjection(of: interaction),
+            interaction: Self.overseerProjection(
+                of: interaction,
+                withholdingApprovalDecisions: overseerWithheldApprovalDecisions(for: interaction, session: session)
+            ),
             manualOnlyReason: overseerManualOnlyReason(for: interaction, session: session)
         )
     }
@@ -36,8 +42,22 @@ extension AgentModeViewModel {
         guard interaction.id == request.interactionID else {
             return .interactionMismatch(currentInteractionID: interaction.id)
         }
-        if let reason = overseerManualOnlyReason(for: interaction, session: session) {
-            return .manualOnly(reason)
+        if AgentSessionLinkPendingInteractionInspection.rawPromptExceedsWorkLimit(interaction) {
+            return .manualOnly(.tooLarge)
+        }
+        let manualOnlyReason = overseerManualOnlyReason(for: interaction, session: session)
+        let inspection = AgentSessionLinkPendingInteractionInspection(
+            interaction: Self.overseerProjection(
+                of: interaction,
+                withholdingApprovalDecisions: overseerWithheldApprovalDecisions(for: interaction, session: session)
+            ),
+            manualOnlyReason: manualOnlyReason
+        )
+        if inspection.exceedsPromptLimit {
+            return .manualOnly(.tooLarge)
+        }
+        if let manualOnlyReason {
+            return .manualOnly(manualOnlyReason)
         }
 
         let resolution: PendingInteractionResolution
@@ -110,12 +130,39 @@ extension AgentModeViewModel {
             if session.pendingWorktreeMergeReview?.id == interaction.id {
                 return .worktreeMergeReview
             }
+            // An ACP request without a genuine one-time allow option stays answerable: decline and
+            // cancel are still request-scoped. Only accept is withheld (see below).
             return nil
         case .userInput:
             return interaction.fields.contains(where: \.isSecret) ? .secretInput : nil
         case .question, .mcpElicitation:
             return nil
         }
+    }
+
+    /// Approval decisions an observer may not choose for this exact interaction, even though the
+    /// interaction itself is answerable.
+    ///
+    /// An ACP request whose provider offered no genuine one-time allow option cannot be accepted by
+    /// an observer (the only allow options would widen authority), but decline selects a one-time
+    /// reject or reports `cancelled`, and cancel reports `cancelled`, so both remain available.
+    func overseerWithheldApprovalDecisions(
+        for interaction: AgentRunMCPSnapshot.Interaction,
+        session: TabSession
+    ) -> Set<String> {
+        guard interaction.kind == .approval,
+              let approval = session.pendingApproval,
+              approval.id == interaction.id,
+              !Self.overseerMayAccept(approval)
+        else { return [] }
+        return ["accept"]
+    }
+
+    /// False only for an ACP request whose provider offered no genuine one-time allow option.
+    /// The controller rechecks the live request's options before sending anything.
+    static func overseerMayAccept(_ approval: AgentApprovalRequest) -> Bool {
+        guard case .acp = approval.requestID else { return true }
+        return approval.overseerOneTimeAllowAvailable == true
     }
 
     /// Session-wide and policy-amending approvals reach beyond the one request being answered.
@@ -162,13 +209,15 @@ extension AgentModeViewModel {
     /// Option labels stay verbatim because they are the values an answer must name; free text
     /// (titles, prompts, context, descriptions, details) passes through the oversight redactor.
     static func overseerProjection(
-        of interaction: AgentRunMCPSnapshot.Interaction
+        of interaction: AgentRunMCPSnapshot.Interaction,
+        withholdingApprovalDecisions withheld: Set<String> = []
     ) -> AgentRunMCPSnapshot.Interaction {
         typealias Interaction = AgentRunMCPSnapshot.Interaction
         let redact = { (text: String?) in text.map { AgentSessionLinkTextRedactor.redact($0) } }
         let options = interaction.options
             .filter { option in
-                interaction.kind != .approval || overseerApprovalDecisionLabels.contains(option.label)
+                interaction.kind != .approval
+                    || (overseerApprovalDecisionLabels.contains(option.label) && !withheld.contains(option.label))
             }
             .map { Interaction.Option(label: $0.label, description: redact($0.description)) }
         let fields = interaction.fields.map { field in
@@ -199,7 +248,7 @@ extension AgentModeViewModel {
             fields: fields,
             details: interaction.details.map {
                 Interaction.Detail(
-                    label: $0.label,
+                    label: AgentSessionLinkTextRedactor.redact($0.label),
                     value: AgentSessionLinkTextRedactor.redact($0.value),
                     isCode: $0.isCode
                 )
@@ -218,6 +267,11 @@ extension AgentModeViewModel {
         authorize: @escaping @MainActor @Sendable () async -> Bool,
         decisionLabel: String?
     ) async -> AgentSessionLinkInteractionResponseOutcome {
+        // Refuse accept before touching the provider when no genuine one-time allow option was
+        // offered. Decline and cancel still go through; the controller keeps them request-scoped.
+        if decision == .accept, !Self.overseerMayAccept(approval) {
+            return .manualOnly(.noOneTimeAllowOption)
+        }
         guard let controller = session.acpController else { return .unavailable }
         let approvalID = approval.id
         let result = await controller.respondToPermissionRequestForOverseer(

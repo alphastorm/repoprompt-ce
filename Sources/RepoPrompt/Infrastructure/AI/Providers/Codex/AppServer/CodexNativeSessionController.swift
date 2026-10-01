@@ -1,5 +1,7 @@
 import Foundation
 import OSLog
+import RepoPromptFoundation
+import RepoPromptInstrumentation
 
 private actor CodexInboundStreamTaskStartGate {
     private var continuation: CheckedContinuation<Void, Never>?
@@ -94,6 +96,13 @@ enum CodexTurnSteerError: Error, LocalizedError, Equatable {
         turnKind: String?,
         failure: CodexAppServerClient.RequestFailure
     )
+
+    /// When returned by `steerUserTurn`, these cases are rejected RPCs, not ambiguous transport failures.
+    var definitivelyRejectsInput: Bool {
+        switch self {
+        case .noActiveTurn, .expectedTurnMismatch, .activeTurnNotSteerable: true
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -221,6 +230,19 @@ final class CodexNativeSessionController {
         let task: Task<Void, Never>
     }
 
+    private let perfRecorder: any AgentModePerfRecording
+
+    #if DEBUG
+        func debugRecordLifecyclePhaseForTesting() async {
+            await recordLifecyclePhase(
+                .runtimeResolution,
+                outcome: .succeeded,
+                startMS: perfRecorder.timestampMSIfEnabled(),
+                includeTransportGeneration: false
+            )
+        }
+    #endif
+
     private static let logger = Logger(
         subsystem: "com.repoprompt.agents",
         category: "CodexNativeSessionController"
@@ -234,13 +256,13 @@ final class CodexNativeSessionController {
     }
 
     #if DEBUG
-        private static func lifecycleOutcome(for error: Error) -> AgentModePerfDiagnostics.CodexLifecycleOutcome {
+        private static func lifecycleOutcome(for error: Error) -> AgentPerfCodexLifecycleOutcome {
             error is CancellationError ? .cancelled : .failed
         }
 
         private func recordLifecyclePhase(
-            _ phase: AgentModePerfDiagnostics.CodexLifecyclePhase,
-            outcome: AgentModePerfDiagnostics.CodexLifecycleOutcome,
+            _ phase: AgentPerfCodexLifecyclePhase,
+            outcome: AgentPerfCodexLifecycleOutcome,
             startMS: Double?,
             includeTransportGeneration: Bool
         ) async {
@@ -250,7 +272,7 @@ final class CodexNativeSessionController {
             } else {
                 nil
             }
-            AgentModePerfDiagnostics.recordCodexLifecyclePhase(
+            perfRecorder.recordCodexLifecyclePhase(
                 phase,
                 outcome: outcome,
                 startMS: startMS,
@@ -1124,7 +1146,7 @@ final class CodexNativeSessionController {
         recordRetiredHookTrustGeneration(generation)
         Self.logger.error("Codex hook-trust mutation unsettled; retiring transport generation=\(generation, privacy: .public)")
         #if DEBUG
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "provider.codex.hookTrust.transportRetiring",
                 tabID: tabID,
                 fields: [
@@ -1161,7 +1183,7 @@ final class CodexNativeSessionController {
         guard let generation else { return }
         Self.logger.notice("Codex hook-trust settlement recovery finished; generation=\(generation, privacy: .public) succeeded=\(succeeded, privacy: .public)")
         #if DEBUG
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "provider.codex.hookTrust.settlementRecoveryFinished",
                 tabID: tabID,
                 fields: [
@@ -1343,12 +1365,12 @@ final class CodexNativeSessionController {
     func listHooksForCurrentWorkspace() async throws -> CodexHookInventory {
         let service = hookTrustService()
         #if DEBUG
-            let lockWaitStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let lockWaitStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         do {
             return try await hookOperationMutex.withLock {
                 #if DEBUG
-                    AgentModePerfDiagnostics.durationEvent(
+                    perfRecorder.durationEvent(
                         "provider.codex.hookTrust.localLockWait",
                         startMS: lockWaitStartMS,
                         tabID: tabID
@@ -1371,21 +1393,21 @@ final class CodexNativeSessionController {
     ) async throws -> CodexHookInventory {
         let service = hookTrustService()
         #if DEBUG
-            let localLockWaitStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let localLockWaitStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         do {
             return try await hookOperationMutex.withLock {
                 #if DEBUG
-                    AgentModePerfDiagnostics.durationEvent(
+                    perfRecorder.durationEvent(
                         "provider.codex.hookTrust.localLockWait",
                         startMS: localLockWaitStartMS,
                         tabID: tabID
                     )
-                    let globalLockWaitStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                    let globalLockWaitStartMS = perfRecorder.timestampMSIfEnabled()
                 #endif
                 return try await Self.hookTrustWriteMutex.withLock {
                     #if DEBUG
-                        AgentModePerfDiagnostics.durationEvent(
+                        perfRecorder.durationEvent(
                             "provider.codex.hookTrust.globalLockWait",
                             startMS: globalLockWaitStartMS,
                             tabID: tabID
@@ -1430,7 +1452,8 @@ final class CodexNativeSessionController {
         clientShutdownBehavior: ClientShutdownBehavior = .none,
         expectedMCPClientName: String? = nil,
         requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])? = nil,
-        hookTrustFaultInjection: HookTrustFaultInjection = .init()
+        hookTrustFaultInjection: HookTrustFaultInjection = .init(),
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.client = client
         self.runID = runID
@@ -1442,6 +1465,7 @@ final class CodexNativeSessionController {
         self.expectedMCPClientName = expectedMCPClientName
         self.requestExecutor = requestExecutor
         self.hookTrustFaultInjection = hookTrustFaultInjection
+        self.perfRecorder = perfRecorder
         rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled()
         rawEventLogFileURL = nil
         rawEventLogFileThreadID = nil
@@ -1828,7 +1852,7 @@ final class CodexNativeSessionController {
             // provisioning. The same client-held runtime is reused at process launch, including when
             // the bundled package is unavailable and a valid override exists only in the login shell.
             #if DEBUG
-                let runtimeResolutionStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                let runtimeResolutionStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
             let runtime: CodexRuntimeAuthority.Runtime
             do {
@@ -1859,7 +1883,7 @@ final class CodexNativeSessionController {
             // before `client.startIfNeeded()` or any thread/start or thread/resume request.
             if let expectedMCPClientName {
                 #if DEBUG
-                    let provisioningStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                    let provisioningStartMS = perfRecorder.timestampMSIfEnabled()
                 #endif
                 do {
                     try await options.repoPromptMCPProvisioner(runtime)
@@ -1893,7 +1917,7 @@ final class CodexNativeSessionController {
             // Re-check: the pre-launch setup above has suspension points after the first check.
             try Task.checkCancellation()
             #if DEBUG
-                let spawnInitializeStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                let spawnInitializeStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
             do {
                 try await client.startIfNeeded()
@@ -1944,10 +1968,10 @@ final class CodexNativeSessionController {
             let configOverrides = await options.configOverridesProvider()
             let result: [String: Any]
             #if DEBUG
-                let threadPhase: AgentModePerfDiagnostics.CodexLifecyclePhase = resumeThreadID == nil
+                let threadPhase: AgentPerfCodexLifecyclePhase = resumeThreadID == nil
                     ? .threadStart
                     : .threadResume
-                let threadRequestStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                let threadRequestStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
 
             do {
@@ -2174,7 +2198,7 @@ final class CodexNativeSessionController {
         #endif
         let sandboxMode = options.sandboxModeProvider()
         #if DEBUG
-            let turnAcceptanceStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let turnAcceptanceStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         do {
             // turn/start can block for extended model reasoning — no timeout.
@@ -2595,7 +2619,7 @@ final class CodexNativeSessionController {
         }
         if clientShutdownBehavior == .stopOnShutdown {
             #if DEBUG
-                let shutdownStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                let shutdownStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
             await client.stop()
             #if DEBUG

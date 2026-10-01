@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptInstrumentation
 import XCTest
 
 /// Durable oversight intent: exact load classification, token-versioned mutation receipts,
@@ -9,6 +10,57 @@ import XCTest
 /// delete a re-added pair, or a blocked file can be silently overwritten, every layer above is
 /// reasoning about durable state that is not actually there.
 final class AgentSessionOversightIntentStoreTests: XCTestCase {
+    private final class RestoreEventRecorder: WorkspaceRestorePerfRecording, @unchecked Sendable {
+        private let lock = NSLock()
+        private var recorded: [(String, [String: String])] = []
+        private let fallback = NoopWorkspaceRestorePerfRecorder()
+
+        var isEnabled: Bool {
+            true
+        }
+
+        func timestampMSIfEnabled() -> Double? {
+            1
+        }
+
+        func timestampMS() -> Double {
+            fallback.timestampMS()
+        }
+
+        func elapsedMS(since startMS: Double) -> Double {
+            fallback.elapsedMS(since: startMS)
+        }
+
+        func formatMS(_ value: Double) -> String {
+            fallback.formatMS(value)
+        }
+
+        func formatElapsedMS(since startMS: Double) -> String {
+            fallback.formatElapsedMS(since: startMS)
+        }
+
+        func shortID(_ id: UUID?) -> String {
+            fallback.shortID(id)
+        }
+
+        @MainActor func nextAgentActivationTrueCount() -> Int {
+            0
+        }
+
+        func log(_: @autoclosure () -> String) {}
+        func event(_ name: String, fields: [String: String]) {
+            lock.lock()
+            recorded.append((name, fields))
+            lock.unlock()
+        }
+
+        func snapshot() -> [(String, [String: String])] {
+            lock.lock()
+            defer { lock.unlock() }
+            return recorded
+        }
+    }
+
     private final class WriteFailureGate: @unchecked Sendable {
         private let lock = NSLock()
         private var failing = false
@@ -54,7 +106,8 @@ final class AgentSessionOversightIntentStoreTests: XCTestCase {
         mode: AgentSessionOversightPersistenceMode = .enabled,
         writer: (@Sendable (Data, URL) throws -> Void)? = nil,
         maxFileByteCount: Int = AgentSessionOversightIntentStore.maxFileByteCount,
-        maxDecodedRowCount: Int = AgentSessionOversightIntentStore.maxDecodedRowCount
+        maxDecodedRowCount: Int = AgentSessionOversightIntentStore.maxDecodedRowCount,
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
     ) -> AgentSessionOversightIntentStore {
         AgentSessionOversightIntentStore(
             fileURL: fileURL,
@@ -63,7 +116,8 @@ final class AgentSessionOversightIntentStoreTests: XCTestCase {
             writer: writer ?? { data, url in try data.write(to: url, options: .atomic) },
             now: { Date(timeIntervalSince1970: 1_700_000_000) },
             maxFileByteCount: maxFileByteCount,
-            maxDecodedRowCount: maxDecodedRowCount
+            maxDecodedRowCount: maxDecodedRowCount,
+            restorePerfRecorder: restorePerfRecorder
         )
     }
 
@@ -81,6 +135,20 @@ final class AgentSessionOversightIntentStoreTests: XCTestCase {
     }
 
     // MARK: - Load
+
+    func testVersionOneDocumentLoadsWithoutMigrationOrRewriting() async throws {
+        let existing = pair()
+        let encoded = try JSONEncoder().encode(AgentSessionOversightIntentDocument(version: 1, links: [existing]))
+        try encoded.write(to: fileURL, options: .atomic)
+
+        guard case let .ready(load) = await makeStore().loadForLaunch() else {
+            return XCTFail("Expected a v1 document to load")
+        }
+        XCTAssertEqual(AgentSessionOversightIntentDocument.currentVersion, 1)
+        XCTAssertEqual(load.source, .loaded)
+        XCTAssertEqual(load.pairs, [existing])
+        XCTAssertEqual(try Data(contentsOf: fileURL), encoded, "Loading v1 must not migrate or rewrite it")
+    }
 
     func testLoadDeduplicatesAndDropsSelfPairsWithoutRewritingTheFile() async throws {
         let observer = UUID()
@@ -108,7 +176,13 @@ final class AgentSessionOversightIntentStoreTests: XCTestCase {
     }
 
     func testMissingFileLoadsEmptyAndWritable() async throws {
-        let store = makeStore()
+        var rendered = false
+        NoopWorkspaceRestorePerfRecorder().log({ rendered = true
+            return "private payload" }())
+        XCTAssertFalse(rendered, "the disabled-path no-op must not render a private payload")
+
+        let recorder = RestoreEventRecorder()
+        let store = makeStore(restorePerfRecorder: recorder)
         guard case let .ready(load) = await store.loadForLaunch() else {
             return XCTFail("Expected a ready load")
         }
@@ -119,6 +193,26 @@ final class AgentSessionOversightIntentStoreTests: XCTestCase {
         let receipt = await store.insert(inserted)
         XCTAssertEqual(receipt.outcome, .applied)
         XCTAssertEqual(try decodedLinks(), [inserted])
+        let events = recorder.snapshot()
+        XCTAssertEqual(events.map(\.0), ["oversight.store.load", "oversight.store.receipt"])
+        XCTAssertEqual(events[0].1, ["result": "missing", "pairs": "0"])
+        XCTAssertEqual(events[1].1, [
+            "op": "insert", "outcome": "applied", "wroteFile": "1", "revision": "1", "transitions": "1"
+        ])
+        let diagnosticText = events.map { String(describing: $0) }.joined()
+        XCTAssertFalse(diagnosticText.contains(inserted.observerSessionID.uuidString))
+        XCTAssertFalse(diagnosticText.contains(inserted.targetSessionID.uuidString))
+        XCTAssertFalse(diagnosticText.contains(directory.path))
+
+        let previousLogging = WorkspaceRestorePerfLog.debugProcessOverrideEnabled
+        WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(true)
+        defer { WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(previousLogging) }
+        let marker = "oversight.contract.\(UUID().uuidString)"
+        AppWorkspaceRestorePerfRecorder().event(marker, fields: ["state": "ready state"])
+        let renderedEvents = WorkspaceRestorePerfLog.recentMetricLinesSnapshot(limit: 2000)
+            .filter { $0.contains(marker) }
+        XCTAssertEqual(renderedEvents.count, 1)
+        XCTAssertTrue(renderedEvents[0].hasSuffix("\(marker) state=ready_state"))
     }
 
     /// Add, Stop, and the presentation surface all call `loadForLaunch()`, so the classification has
@@ -145,73 +239,18 @@ final class AgentSessionOversightIntentStoreTests: XCTestCase {
         XCTAssertEqual(repeatedMissing.source, .missing)
     }
 
-    // MARK: - Delegation
+    // MARK: - Legacy delegation migration
 
-    /// The user's management / auto-approval choice is part of the saved pair: it survives a relaunch
-    /// and is dropped together with the pair.
-    func testDelegationRoundTripsAcrossLaunchesAndIsDroppedWithItsPair() async throws {
-        let managed = pair()
-        let plain = pair()
-        let first = makeStore()
-        _ = await first.loadForLaunch()
-        _ = await first.insert(managed)
-        _ = await first.insert(plain)
-
-        let receipt = await first.setDelegation(for: managed, manage: true)
-        XCTAssertEqual(receipt.outcome, .applied)
-        XCTAssertTrue(receipt.wroteFile)
-        // Field-level merge: setting one field keeps the other.
-        _ = await first.setDelegation(for: managed, autoApprovePermissions: true)
-        let repeated = await first.setDelegation(for: managed, manage: true)
-        XCTAssertEqual(repeated.outcome, .unchanged)
-        XCTAssertFalse(repeated.wroteFile)
-
-        let relaunched = makeStore()
-        guard case let .ready(load) = await relaunched.loadForLaunch() else {
-            return XCTFail("Expected a ready load")
-        }
-        XCTAssertEqual(load.pairs, [managed, plain])
-        XCTAssertEqual(
-            load.delegationByPair,
-            [managed: AgentSessionOversightDelegation(manage: true, autoApprovePermissions: true)]
-        )
-        let plainDelegation = await relaunched.delegation(for: plain)
-        XCTAssertEqual(plainDelegation, .none)
-
-        let token = try XCTUnwrap(load.tokenByPair[managed])
-        let removal = await relaunched.remove(managed, ifCurrent: token)
-        XCTAssertEqual(removal.outcome, .applied)
-        let afterRemoval = await relaunched.delegation(for: managed)
-        XCTAssertEqual(afterRemoval, .none)
-
-        // Re-adding the same pair starts with no delegation: removal ended the relationship.
-        _ = await relaunched.insert(managed)
-        let afterReAdd = await relaunched.delegation(for: managed)
-        XCTAssertEqual(afterReAdd, .none)
-        let third = makeStore()
-        guard case let .ready(reloaded) = await third.loadForLaunch() else {
-            return XCTFail("Expected a ready load")
-        }
-        XCTAssertTrue(reloaded.delegationByPair.isEmpty)
-    }
-
-    /// Delegation never creates a relationship on its own.
-    func testDelegationForAnUnsavedPairIsAbsentAndWritesNothing() async {
-        let store = makeStore()
-        _ = await store.loadForLaunch()
-        let receipt = await store.setDelegation(for: pair(), manage: true)
-        XCTAssertEqual(receipt.outcome, .absent)
-        XCTAssertFalse(receipt.wroteFile)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
-    }
-
-    /// Files written before delegation existed load unchanged, and a document with no delegation keeps
-    /// the original on-disk shape so an older build reads it exactly as before.
-    func testLegacyDocumentLoadsAndAnUndelegatedDocumentOmitsTheDelegationsKey() async throws {
+    func testLegacyDelegationsAreIgnoredButDirectedLinksSurviveAndNextWriteDropsThem() async throws {
         let observer = UUID()
         let target = UUID()
+        let orphan = UUID()
         try writeRawDocument("""
-        {"version":1,"links":[{"observerSessionID":"\(observer.uuidString)","targetSessionID":"\(target.uuidString)"}]}
+        {"version":1,"links":[{"observerSessionID":"\(observer.uuidString)","targetSessionID":"\(target.uuidString)"}],
+        "delegations":[
+          {"observerSessionID":"\(observer.uuidString)","targetSessionID":"\(target.uuidString)","manage":false,"autoApprovePermissions":true},
+          {"observerSessionID":"\(orphan.uuidString)","targetSessionID":"\(target.uuidString)","manage":true}
+        ]}
         """)
         let store = makeStore()
         guard case let .ready(load) = await store.loadForLaunch() else {
@@ -219,45 +258,14 @@ final class AgentSessionOversightIntentStoreTests: XCTestCase {
         }
         let legacy = AgentSessionOversightIntent(observerSessionID: observer, targetSessionID: target)
         XCTAssertEqual(load.source, .loaded)
-        XCTAssertEqual(load.pairs, [legacy])
-        XCTAssertTrue(load.delegationByPair.isEmpty)
+        XCTAssertEqual(load.pairs, [legacy], "Legacy fields cannot reverse or create a pair")
+        XCTAssertEqual(try JSONDecoder().decode(AgentSessionOversightIntentDocument.self, from: Data(contentsOf: fileURL)).links, [legacy])
 
         _ = await store.insert(pair())
         let written = try String(contentsOf: fileURL, encoding: .utf8)
-        XCTAssertFalse(written.contains("delegations"))
-
-        _ = await store.setDelegation(for: legacy, autoApprovePermissions: true)
-        let delegated = try Data(contentsOf: fileURL)
-        let document = try JSONDecoder().decode(AgentSessionOversightIntentDocument.self, from: delegated)
-        XCTAssertEqual(document.version, 1, "Additive field: the schema version must not block older builds.")
-        XCTAssertEqual(document.delegations?.map(\.pair), [legacy])
-        XCTAssertEqual(document.delegations?.first?.manage, nil, "Unset fields are omitted, not written false.")
-        XCTAssertEqual(document.delegations?.first?.autoApprovePermissions, true)
-    }
-
-    /// A delegation row whose pair is not saved is an authorization with no relationship behind it.
-    func testOrphanDelegationRowsAreIgnoredOnLoad() async throws {
-        let saved = pair()
-        let orphan = pair()
-        let document = AgentSessionOversightIntentDocument(
-            links: [saved],
-            delegations: [
-                AgentSessionOversightDelegationRecord(
-                    observerSessionID: orphan.observerSessionID,
-                    targetSessionID: orphan.targetSessionID,
-                    manage: true,
-                    autoApprovePermissions: true
-                )
-            ]
-        )
-        try JSONEncoder().encode(document).write(to: fileURL, options: .atomic)
-
-        let store = makeStore()
-        guard case let .ready(load) = await store.loadForLaunch() else {
-            return XCTFail("Expected a ready load")
-        }
-        XCTAssertEqual(load.pairs, [saved])
-        XCTAssertTrue(load.delegationByPair.isEmpty)
+        XCTAssertFalse(written.contains("delegations"), "A write discards obsolete authority data")
+        XCTAssertTrue(written.contains(observer.uuidString))
+        XCTAssertTrue(written.contains(target.uuidString))
     }
 
     // MARK: - Insert / remove

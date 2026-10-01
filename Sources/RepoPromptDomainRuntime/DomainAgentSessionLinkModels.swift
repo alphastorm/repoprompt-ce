@@ -45,15 +45,11 @@ package enum DomainAgentSessionLinkCapability: String, CaseIterable, Hashable, S
     case wait
     case read
     case sendWhenIdle = "send_when_idle"
-    /// The user's explicit delegation of *management* over one exact target: inspecting and
-    /// answering its pending prompts and steering its runs on the user's behalf.
-    ///
-    /// Never part of `version1`, never inferred from role, parentage, or another grant, and never
-    /// carried across a relink, fork, or restart. Only an explicit user action on one exact link
-    /// generation adds or removes it (`DomainAgentSessionLinkAuthority.setManagement`).
+    /// Management of one exact target: inspecting and answering its pending prompts and steering
+    /// its runs on the user's behalf. Authorization still requires the exact live grant and lease.
     case manage
 
-    /// V1 capabilities are fixed and never inferred from role or parentage.
+    /// Explicit restricted capability set retained for internal callers and tests.
     package static let version1: Set<DomainAgentSessionLinkCapability> = [
         .poll,
         .wait,
@@ -61,7 +57,7 @@ package enum DomainAgentSessionLinkCapability: String, CaseIterable, Hashable, S
         .sendWhenIdle,
     ]
 
-    /// A watch grant plus the user's explicit management delegation.
+    /// The default capability set for newly reserved links.
     package static let managed: Set<DomainAgentSessionLinkCapability> = version1.union([.manage])
 }
 
@@ -222,11 +218,61 @@ package struct DomainAgentSessionContextLoad: Hashable, Sendable {
     }
 }
 
+/// Derived target state for passive oversight. Blocker names are internal and opaque on the wire;
+/// only an empty versus non-empty list is contractual. Counts come from the target view model's child census.
+package struct DomainAgentSessionLaneBoard: Hashable, Sendable {
+    package enum RunOutcome: String, Hashable, Sendable {
+        case none
+        case running
+        case awaitingUser = "awaiting_user"
+        case completed
+        case cancelled
+        case failed
+    }
+
+    package enum FailureReason: String, Hashable, Sendable {
+        case processCrash = "process_crash"
+        case timeout
+        case agentError = "agent_error"
+        case cancelled
+    }
+
+    package let runOutcome: RunOutcome
+    package let failureReason: FailureReason?
+    package let sendBlockers: [String]
+    package let subagentRunning: Int
+    package let subagentFinished: Int
+
+    package init(
+        runOutcome: RunOutcome,
+        failureReason: FailureReason?,
+        sendBlockers: [String],
+        subagentRunning: Int,
+        subagentFinished: Int
+    ) {
+        self.runOutcome = runOutcome
+        self.failureReason = failureReason
+        self.sendBlockers = sendBlockers
+        self.subagentRunning = subagentRunning
+        self.subagentFinished = subagentFinished
+    }
+
+    /// Explicit quiet board for fixtures; snapshot construction itself has no default.
+    package static let empty = DomainAgentSessionLaneBoard(
+        runOutcome: .none,
+        failureReason: nil,
+        sendBlockers: [],
+        subagentRunning: 0,
+        subagentFinished: 0
+    )
+}
+
 package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
     package let sessionID: UUID
     package let displayName: String?
     package let providerDisplayName: String?
     package let status: DomainAgentSessionLinkStatus
+    package let board: DomainAgentSessionLaneBoard
     package let idleForSend: Bool
     package let idleSince: Date?
     package let waitingOn: DomainAgentSessionWaitingOn?
@@ -248,6 +294,7 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
         displayName: String?,
         providerDisplayName: String?,
         status: DomainAgentSessionLinkStatus,
+        board: DomainAgentSessionLaneBoard,
         idleForSend: Bool,
         idleSince: Date? = nil,
         waitingOn: DomainAgentSessionWaitingOn? = nil,
@@ -267,6 +314,7 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
             maxBytes: DomainAgentSessionLinkTextBudget.displayNameMaxBytes
         )
         self.status = status
+        self.board = board
         // A target that is not idle can never be admitted for send, regardless of what the bridge claims.
         self.idleForSend = idleForSend && status == .idle && pendingInteractionKind == nil
         self.idleSince = status == .idle && pendingInteractionKind == nil ? idleSince : nil
@@ -345,8 +393,7 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
 /// Deterministically ordered inventory for one endpoint.
 package struct DomainAgentSessionLinkInventory: Hashable, Sendable {
     package let sessionID: UUID
-    /// Advances only when this observer's grant membership changes, or when the user changes the
-    /// management delegation of one of its grants (the capabilities this observer is told about).
+    /// Advances only when this observer's grant membership changes.
     package let linkSetRevision: UInt64
     package let authorityRevision: UInt64
     package let items: [DomainAgentSessionLinkInventoryItem]
@@ -513,6 +560,8 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
     /// authority rechecks the predicate at activation, in the same actor turn that would insert the
     /// new grant, so revoking the previous final link cannot race this precondition.
     package let requiresExistingOutboundLink: Bool
+    /// Lane creation must still have an exact direct relationship when this grant activates.
+    package let requiresExistingDirectLink: Bool
     /// Advisory hint that this reservation is currently expected to install target observation.
     ///
     /// This is **not** authoritative. A reservation elected here can still be abandoned or
@@ -532,6 +581,7 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
         target: DomainAgentSessionLinkEndpointIdentity,
         capabilities: Set<DomainAgentSessionLinkCapability>,
         requiresExistingOutboundLink: Bool,
+        requiresExistingDirectLink: Bool = false,
         provisionallyInstallsTargetObservation: Bool,
         reservedAtAuthorityRevision: UInt64
     ) {
@@ -541,6 +591,7 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
         self.target = target
         self.capabilities = capabilities
         self.requiresExistingOutboundLink = requiresExistingOutboundLink
+        self.requiresExistingDirectLink = requiresExistingDirectLink
         self.provisionallyInstallsTargetObservation = provisionallyInstallsTargetObservation
         self.reservedAtAuthorityRevision = reservedAtAuthorityRevision
     }
@@ -598,6 +649,7 @@ package enum DomainAgentSessionLinkReservationRejection: String, Equatable, Send
     case targetBindingUnresolved = "target_binding_unresolved"
     case reservationAlreadyPending = "reservation_already_pending"
     case observerHasNoActiveOutboundLink = "observer_has_no_active_outbound_link"
+    case observerHasNoActiveLink = "observer_has_no_active_link"
 }
 
 package enum DomainAgentSessionLinkActivationDisposition: Equatable, Sendable {
@@ -621,6 +673,7 @@ package enum DomainAgentSessionLinkActivationRejection: String, Equatable, Senda
     case endpointDrift = "endpoint_drift"
     case snapshotSessionMismatch = "snapshot_session_mismatch"
     case observerHasNoActiveOutboundLink = "observer_has_no_active_outbound_link"
+    case observerHasNoActiveLink = "observer_has_no_active_link"
 }
 
 package enum DomainAgentSessionLinkRevocationDisposition: Equatable, Sendable {
@@ -723,14 +776,10 @@ package enum DomainAgentSessionLinkWaitOutcome: Equatable, Sendable {
     case linkUnavailable(sessionID: UUID)
     case cursorExpired(sessionID: UUID)
     case invalidRequest
-    /// The user changed the observer's management delegation on the named link while this wait was
-    /// parked. The wait ends early so the running model learns its new capabilities now; the
-    /// successor cursors consume no target change and may be passed straight back to another wait.
-    case capabilitiesChanged(sessionID: UUID)
 
     package var triggeredSessionID: UUID? {
         switch self {
-        case let .changed(sessionID), let .idle(sessionID), let .capabilitiesChanged(sessionID):
+        case let .changed(sessionID), let .idle(sessionID):
             sessionID
         case let .revoked(notice):
             notice.targetSessionID
@@ -745,18 +794,12 @@ package struct DomainAgentSessionLinkWaitResult: Equatable, Sendable {
     package let outcome: DomainAgentSessionLinkWaitOutcome
     /// Successor cursors for every authorized target, in request order.
     package let targets: [DomainAgentSessionLinkTargetState]
-    /// Capability-change notices claimed for this result in the same actor turn that woke it, so a
-    /// `capabilities_changed` wake always carries what it was woken for. Empty for other outcomes.
-    package let capabilityNotices: [DomainAgentSessionLinkCapabilityNotice]
-
     package init(
         outcome: DomainAgentSessionLinkWaitOutcome,
-        targets: [DomainAgentSessionLinkTargetState],
-        capabilityNotices: [DomainAgentSessionLinkCapabilityNotice] = []
+        targets: [DomainAgentSessionLinkTargetState]
     ) {
         self.outcome = outcome
         self.targets = targets
-        self.capabilityNotices = capabilityNotices
     }
 }
 
@@ -866,6 +909,9 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
     package let resultingRunState: String
     /// Set by the authority when an identical key/digest pair replays a stored outcome.
     package let duplicate: Bool
+    /// Compaction only: the command went out on a provider path that may keep compacting in the
+    /// background after its prompt turn completes, so an early next turn can cancel it.
+    package let compactionRunsInBackground: Bool
 
     package init(
         targetSessionID: UUID,
@@ -873,7 +919,8 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
         acceptedAt: Date,
         deliveryState: DomainAgentSessionLinkDeliveryState,
         resultingRunState: String,
-        duplicate: Bool = false
+        duplicate: Bool = false,
+        compactionRunsInBackground: Bool = false
     ) {
         self.targetSessionID = targetSessionID
         self.targetItemID = targetItemID
@@ -881,6 +928,7 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
         self.deliveryState = deliveryState
         self.resultingRunState = resultingRunState
         self.duplicate = duplicate
+        self.compactionRunsInBackground = compactionRunsInBackground
     }
 
     package func markedDuplicate() -> DomainAgentSessionLinkSendReceipt {
@@ -890,7 +938,8 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
             acceptedAt: acceptedAt,
             deliveryState: deliveryState,
             resultingRunState: resultingRunState,
-            duplicate: true
+            duplicate: true,
+            compactionRunsInBackground: compactionRunsInBackground
         )
     }
 }
@@ -954,67 +1003,6 @@ package enum DomainAgentSessionLinkSendCommitDisposition: Equatable, Sendable {
     case shuttingDown
 }
 
-// MARK: - Management delegation
-
-/// Outcome of one explicit user change to a link's management delegation.
-package enum DomainAgentSessionLinkManagementDisposition: Equatable, Sendable {
-    /// The capability set changed. `observerInventory` is read in the same actor turn as the write,
-    /// for the same reason activation returns one: the caller can republish without a race.
-    case changed(
-        DomainAgentSessionLinkGrant,
-        observerInventory: DomainAgentSessionLinkInventory
-    )
-    /// The exact grant already had the requested state.
-    case unchanged(DomainAgentSessionLinkGrant)
-    /// The exact link generation is gone, or its recorded endpoints no longer match.
-    case notFound
-    case shuttingDown
-}
-
-/// One pending, observer-facing statement that the user changed what the observer may do on one
-/// exact link generation, owed to that observer's **running** model until some channel delivers it.
-///
-/// Authority changes are immediate and never wait for this: the grant's capability set is the only
-/// authorization input. The notice exists so a model already mid-turn stops reasoning from the
-/// capabilities it was told about earlier — including its own earlier refusals — rather than
-/// discovering the change only at its next turn.
-///
-/// Scoped to the exact observer endpoint and link generation that changed. A notice never names a
-/// session the observer was not granted, never reaches the target, and never transfers to another
-/// incarnation, a relinked generation, or a session the target itself oversees.
-package struct DomainAgentSessionLinkCapabilityNotice: Equatable, Hashable, Sendable {
-    package let linkID: UUID
-    package let linkGeneration: UInt64
-    package let targetSessionID: UUID
-    /// The management state the user just set. Always equal to the grant's state when delivered:
-    /// every later change replaces this notice rather than queueing behind it.
-    package let managed: Bool
-    /// The observer's link-set revision the change produced. An accepted inventory block at or past
-    /// this revision already told the model the same fact.
-    package let observerLinkSetRevision: UInt64
-    /// Per-observer-endpoint order of changes, so a restored notice never overwrites a newer one.
-    package let sequence: UInt64
-    package let changedAt: Date
-
-    package init(
-        linkID: UUID,
-        linkGeneration: UInt64,
-        targetSessionID: UUID,
-        managed: Bool,
-        observerLinkSetRevision: UInt64,
-        sequence: UInt64,
-        changedAt: Date
-    ) {
-        self.linkID = linkID
-        self.linkGeneration = linkGeneration
-        self.targetSessionID = targetSessionID
-        self.managed = managed
-        self.observerLinkSetRevision = observerLinkSetRevision
-        self.sequence = sequence
-        self.changedAt = changedAt
-    }
-}
-
 // MARK: - Change events
 
 /// Identity/revision-only change feed. Consumers refetch an authoritative snapshot.
@@ -1022,9 +1010,6 @@ package struct DomainAgentSessionLinkChangeEvent: Hashable, Sendable {
     package enum Kind: String, CaseIterable, Hashable, Sendable {
         case activated
         case revoked
-        /// One exact grant's capability set changed in place (the user's management delegation).
-        /// Membership is unchanged, but the observer's advertised capabilities are not.
-        case capabilitiesChanged = "capabilities_changed"
         case targetStateChanged = "target_state_changed"
         case draining
         case shutdown

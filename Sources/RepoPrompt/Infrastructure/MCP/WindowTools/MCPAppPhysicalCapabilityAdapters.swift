@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptWorkspaceCore
 
 /// Explicit app-process physical capability adapters used by domain-owned tool bindings.
 /// Presentation and AppKit interactions remain on MainActor; schema, policy, and catalog
@@ -370,6 +371,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         let executeAgentRun: ExecuteTool
         let executeAgentManage: ExecuteTool
         let executeAgentSessionLink: ExecuteTool
+        let executeAgentSelf: ExecuteTool
         let requireTargetWindow: RequireTargetWindow
         let requireCurrentTabContext: RequireCurrentTabContext
         let requireAgentModeConnection: RequireAgentModeConnection

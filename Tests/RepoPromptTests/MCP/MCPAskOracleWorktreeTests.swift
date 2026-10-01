@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptWorkspaceCore
 import XCTest
 
 #if DEBUG

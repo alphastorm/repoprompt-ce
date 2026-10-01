@@ -49,16 +49,23 @@ enum WindowStateCompositionFactory {
         #if DEBUG
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
                 enableCatalogShardShadowValidation: false,
-                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled
+                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
+                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
+                perfRecorder: AppAgentModePerfRecorder()
             )
         #else
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
-                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled
+                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
+                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
+                perfRecorder: AppAgentModePerfRecorder()
             )
         #endif
         let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? defaultWorkspaceFileContextStore
         let workspaceSearchService = WorkspaceSearchService()
-        let workspaceFilesViewModel = WorkspaceFilesViewModel(workspaceFileContextStore: workspaceFileContextStore)
+        let workspaceFilesViewModel = WorkspaceFilesViewModel(
+            workspaceFileContextStore: workspaceFileContextStore,
+            restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
+        )
         if injectedWorkspaceFileContextStore == nil {
             workspaceFilesViewModel.bindNonGitCodeMapsSetting(settingsStore)
         }
@@ -86,7 +93,8 @@ enum WindowStateCompositionFactory {
             apiSettingsViewModel: apiSettingsViewModel,
             windowID: windowID,
             settingsManager: settingsManager,
-            storedPromptPersistence: storedPromptPersistence
+            storedPromptPersistence: storedPromptPersistence,
+            perfRecorder: AppAgentModePerfRecorder()
         )
 
         // 7) Create the workspace manager with construction-time runtime persistence ownership.
@@ -98,7 +106,8 @@ enum WindowStateCompositionFactory {
             promptViewModel: promptManager,
             workspaceSearchService: workspaceSearchService,
             domainWorkspaceAuthorityClient: domainWorkspaceClient,
-            switchTimingPolicy: workspaceSwitchTimingPolicy
+            switchTimingPolicy: workspaceSwitchTimingPolicy,
+            restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
         )
         let routerSettingsViewModel = RouterSettingsViewModel(
             settingsStore: settingsStore,
@@ -124,13 +133,15 @@ enum WindowStateCompositionFactory {
             aiQueriesService: aiQueriesService,
             promptViewModel: promptManager,
             workspaceManager: workspaceManager,
-            chatData: chatDataService
+            chatData: chatDataService,
+            restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
         )
 
         // 11) MCP server (one listener app-wide, this window may be owner)
         let applyEditsApprovalStore = ApplyEditsApprovalStore.shared
         let mcpServer = MCPServerViewModel(
             service: sharedMCPService,
+            perfRecorder: AppAgentModePerfRecorder(),
             promptVM: promptManager,
             oracleVM: oracleViewModel,
             workspaceManager: workspaceManager,
@@ -178,7 +189,8 @@ enum WindowStateCompositionFactory {
             oracleViewModel: oracleViewModel,
             settingsManager: settingsStore,
             providerFactory: contextBuilderProviderFactory,
-            codexModelPollingService: codexModelPollingService
+            codexModelPollingService: codexModelPollingService,
+            perfRecorder: AppAgentModePerfRecorder()
         )
 
         // 13) Agent mode (for minimal agent UI)
@@ -190,7 +202,10 @@ enum WindowStateCompositionFactory {
             oracleViewModel: oracleViewModel,
             applyEditsApprovalStore: applyEditsApprovalStore,
             modelRouterSettingsStore: settingsStore,
-            modelRouterRuntime: modelRouterRuntime
+            modelRouterRuntime: modelRouterRuntime,
+            catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
+            restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
+            perfRecorder: AppAgentModePerfRecorder()
         )
         workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
             agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]

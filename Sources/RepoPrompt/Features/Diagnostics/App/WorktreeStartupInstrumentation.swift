@@ -1,30 +1,21 @@
 import Foundation
+import RepoPromptInstrumentation
 #if DEBUG
     import CryptoKit
 #endif
 
-enum WorktreeStartupServingControl: Equatable {
-    case automatic
-    case forceFullCrawl
+struct AppWorktreeStartupPhaseEventSink: WorktreeStartupPhaseEventSink {
+    func record(_ event: WorktreeStartupPhaseEvent) {
+        WorktreeStartupInstrumentation.record(
+            event.phase,
+            context: event.context,
+            route: event.route,
+            fallback: event.fallback
+        )
+    }
 }
 
-struct WorktreeStartupFeatureFlags: Equatable {
-    static let observeDefaultsKey = "observeDiffSeededWorktreeStartup"
-    static let serveDefaultsKey = "serveDiffSeededWorktreeStartup"
-
-    let observeDiffSeededWorktreeStartup: Bool
-    let serveDiffSeededWorktreeStartup: Bool
-
-    init(
-        observeDiffSeededWorktreeStartup: Bool = false,
-        serveDiffSeededWorktreeStartup: Bool = false
-    ) {
-        self.observeDiffSeededWorktreeStartup = observeDiffSeededWorktreeStartup
-        // Serving can never be active without observation authority.
-        self.serveDiffSeededWorktreeStartup = serveDiffSeededWorktreeStartup
-            && observeDiffSeededWorktreeStartup
-    }
-
+extension WorktreeStartupFeatureFlags {
     static func current(defaults: UserDefaults = .standard) -> Self {
         #if DEBUG
             // Diff-seeded worktree startup is always on. In DEBUG we still honor optional
@@ -45,115 +36,20 @@ struct WorktreeStartupFeatureFlags: Equatable {
     }
 }
 
-struct WorktreeStartupContext: Equatable {
-    let agentSessionID: UUID
-    let correlationID: UUID
-    let flags: WorktreeStartupFeatureFlags
-    let servingControl: WorktreeStartupServingControl
-
+extension WorktreeStartupContext {
     init(
         agentSessionID: UUID,
         correlationID: UUID = UUID(),
         flags: WorktreeStartupFeatureFlags = .current(),
         servingControl: WorktreeStartupServingControl = .automatic
     ) {
-        self.agentSessionID = agentSessionID
-        self.correlationID = correlationID
-        self.flags = flags
-        self.servingControl = servingControl
+        self.init(
+            rawAgentSessionID: agentSessionID,
+            correlationID: correlationID,
+            flags: flags,
+            servingControl: servingControl
+        )
     }
-}
-
-enum WorkspaceRootStartupRoute: String, Equatable {
-    case fullCrawl
-    case diffSeedObservation
-    case diffSeedServing
-}
-
-enum WorkspaceRootSeedFallbackReason: String, Equatable {
-    case noReceipt
-    case expiredReceipt
-    case unsupportedDestination
-    case baseUnavailable
-    case baseEvicted
-    case compatibilityMismatch
-    case authorityChanging
-    case authorityUnstable
-    case gitTimeout
-    case gitError
-    case gitMalformedOutput
-    case gitCappedOutput
-    case gitResourceUnavailable
-    case gitEvidenceCorrupt
-    case namespaceEvidenceCorrupt
-    case targetEvidenceIncoherent
-    case evidenceResourceUnavailable
-    case evidenceIOFailure
-    case evidenceWaitDeadlineExceeded
-    case witnessGap
-    case witnessDrop
-    case witnessOverflow
-    case includeCopyFailure
-    case unknownCopiedPath
-    case changedIgnoreAuthority
-    case conflictOrUnmergedIndex
-    case assumeUnchangedIndexEntry
-    case sparseCheckout
-    case submoduleOrNestedRepository
-    case symlinkOrSpecialTopology
-    case unexplainedFilesystemEntry
-    case projectedSearchMismatch
-    case ownerSuperseded
-    case serviceIngressGenerationChanged
-    case watcherRecoveryUncertain
-    case watcherActivationFailure
-    case watcherDrop
-    case watcherOverflow
-    case pendingIngressSequenceGap
-    case seededShardPreparationFailure
-    case cancellation
-}
-
-enum WorktreeStartupPhase: String, Equatable {
-    case agentRunStarted
-    case worktreePreparationStarted
-    case bindingTransitionStarted
-    case rootLoadStarted
-    case shadowVerified
-    case seedWatcherAttached
-    case seedReplayFenced
-    case seedReadyForCommit
-    case seedPublished
-    case seedFallback
-    case rootReady
-    case providerStart
-    #if DEBUG
-        case firstBenchmarkSearchStarted
-        case firstBenchmarkSearchCompleted
-        case firstBenchmarkReadStarted
-        case firstBenchmarkReadCompleted
-        case firstBenchmarkCodemapStarted
-        case firstBenchmarkCodemapCompleted
-        case warmBenchmarkCodemapStarted
-        case warmBenchmarkCodemapCompleted
-        case passiveBenchmarkTreeStarted
-        case passiveBenchmarkTreeCompleted
-        case benchmarkSelectionStarted
-        case benchmarkSelectionCompleted
-    #endif
-    case failed
-}
-
-enum GitProcessCommandFamily: String, Equatable {
-    case treeResolution
-    case treeInventory
-    case treeDelta
-    case indexManifest
-    case status
-    case authorityMetadata
-    case codemapAuthority
-    case repositoryRead
-    case mutation
 }
 
 #if DEBUG

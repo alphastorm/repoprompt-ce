@@ -22,6 +22,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Run repository guardrails
         run: make guardrails
@@ -41,7 +42,7 @@ jobs:
           node-version: 24
 
       - name: Install pinned Codex CLI
-        run: npm install --global @openai/codex@0.156.1
+        run: npm install --global @openai/codex@0.159.0
 
       - name: Validate Codex app-server schema contract
         run: make dev-codex-schema-check
@@ -49,10 +50,94 @@ jobs:
       - name: Run release workflow tests
         run: make release-selftest
 
-  build-and-test:
-    name: Build and Test (root shard ${{ matrix.shard }})
+  build-test-bundles:
+    name: Build Root Test Bundles Once
     runs-on: macos-26
     timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Restore SwiftPM build cache
+        id: rootbundles-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            .build
+            Packages/RepoPromptAgentProviders/.build
+          # Own prefix: must never prefix-match the Sentry or sources caches.
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-rootbundles-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-swiftpm-rootbundles-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}-
+            ${{ runner.os }}-${{ runner.arch }}-swiftpm-rootbundles-
+
+      - name: Run provider package tests
+        run: ./conductor provider-test
+
+      - name: Build root test bundles with import and type-check gates
+        shell: bash
+        env:
+          TYPECHECK_RATCHET_ENFORCE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '1' || '0' }}
+        run: |
+          set -uo pipefail
+          set +e
+          ./conductor ci-build-tests 2>&1 | tee "$RUNNER_TEMP/ci-build-tests-conductor.txt"
+          build_status=${PIPESTATUS[0]}
+          set -e
+          if (( build_status != 0 )); then
+            log_path="$(sed -n 's/^Log:[[:space:]]*//p' "$RUNNER_TEMP/ci-build-tests-conductor.txt" | tail -n 1)"
+            if [[ -n "$log_path" && -f "$log_path" ]]; then
+              cp "$log_path" "$RUNNER_TEMP/ci-build-tests.log"
+              echo 'Compiler errors and test failures from the full conductor log:'
+              grep -E 'error:|FAIL' "$RUNNER_TEMP/ci-build-tests.log" || true
+            else
+              echo "Conductor full log was unavailable: $log_path" >&2
+            fi
+          fi
+          exit "$build_status"
+
+      - name: Upload failed root test build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: root-build-tests-failure-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ci-build-tests.log
+            ${{ runner.temp }}/ci-build-tests-conductor.txt
+          if-no-files-found: warn
+
+      - name: Gate compiler index ratchets on the built sources
+        run: python3 Scripts/modularization_index_graph.py check --output .build/modularization/index-check.json
+
+      - name: Archive only runnable test products and gate attestations
+        run: python3 Scripts/modularization_ci_artifact.py pack --output root-build.tar.gz
+
+      - name: Share the single build with test shards
+        uses: actions/upload-artifact@v4
+        with:
+          name: root-build-${{ github.run_id }}
+          path: root-build.tar.gz
+          retention-days: 1
+
+      # Save the compiled cache only from main, so PR runs restore a warm, main-built cache
+      # (PR-scoped caches would evict it). One key per main commit keeps it current.
+      - name: Save SwiftPM build cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rootbundles-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            .build
+            Packages/RepoPromptAgentProviders/.build
+          key: ${{ steps.rootbundles-cache.outputs.cache-primary-key }}
+
+  build-and-test:
+    name: Test Root Shard (No Build)
+    needs: build-test-bundles
+    runs-on: macos-26
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -63,88 +148,21 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Restore SwiftPM build cache
-        uses: actions/cache@v6
+      - name: Download the single root build
+        uses: actions/download-artifact@v4
         with:
-          path: |
-            .build
-            Packages/RepoPromptAgentProviders/.build
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-swiftpm-
+          name: root-build-${{ github.run_id }}
 
-      - name: Build app product
-        run: swift build --product RepoPrompt
-
-      - name: Build MCP product
-        run: swift build --product repoprompt-mcp
-
-      - name: Run root test shard
+      - name: Restore build bundle and SwiftPM state
         shell: bash
-        run: |
-          set -euo pipefail
-          # `swift test list` discovers every root XCTest suite.
-          # Each suite gets a fresh HOME/TMP/XDG sandbox and one XCTest process.
-          # There are no retries or suite-specific clocks: a failure is a failure.
-          python3 Scripts/ci_app_test_runner.py \
-            --shard-count 4 \
-            --shard-index "${{ matrix.shard }}"
+        run: gzip -dc root-build.tar.gz | tar -xf -
 
-  sentry-enabled-build:
-    name: Sentry-enabled Build
-    runs-on: macos-26
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Restore SwiftPM build cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            .build
-            Packages/RepoPromptAgentProviders/.build
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-sentry-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-swiftpm-
-
-      - name: Build app product with Sentry SDK linked
-        env:
-          REPOPROMPT_ENABLE_SENTRY: "1"
-        run: swift build --product RepoPrompt
-
-      - name: Test serialized Sentry privacy boundary
-        env:
-          REPOPROMPT_ENABLE_SENTRY: "1"
-        run: swift test --filter SentryTelemetryPrivacyTests
-
-  provider-tests:
-    name: Provider Tests
-    runs-on: macos-26
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Restore SwiftPM build cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            .build
-            Packages/RepoPromptAgentProviders/.build
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-provider-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-swiftpm-
-
-      - name: Run provider package tests
-        working-directory: Packages/RepoPromptAgentProviders
-        run: swift test
+      - name: Run root test shard without compiling
+        run: ./conductor ci-shard --shard-count 4 --shard-index ${{ matrix.shard }}
 
   secret-scan:
     name: Secret Scan
-    runs-on: macos-26
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -152,8 +170,15 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Install gitleaks
-        run: brew install gitleaks
+      - name: Install pinned gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - name: Scan introduced commit range
         env:

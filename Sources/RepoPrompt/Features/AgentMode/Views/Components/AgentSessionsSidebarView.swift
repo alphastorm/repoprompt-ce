@@ -1,10 +1,45 @@
 import Combine
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 import SwiftUI
 
 // MARK: - Sessions Sidebar
 
+@MainActor
+enum AgentSidebarCreatorNavigation {
+    nonisolated static func uniqueRoute(
+        for creatorSessionID: UUID,
+        candidates: [AgentSessionDeepLinkRoute]
+    ) -> AgentSessionDeepLinkRoute? {
+        let matches = candidates.filter { $0.sessionID == creatorSessionID }
+        guard let first = matches.first,
+              matches.allSatisfy({ $0.workspaceID == first.workspaceID && $0.tabID == first.tabID })
+        else { return nil }
+        return first
+    }
+
+    static func openIfAvailable(_ creatorSessionID: UUID) async {
+        let candidates = WindowStatesManager.shared.allWindows
+            .filter { !$0.isClosing }
+            .flatMap { window -> [AgentSessionDeepLinkRoute] in
+                AgentNavigationHUDSnapshotBuilder.currentWindowSnapshot(windowState: window)
+                    .items.compactMap { item in
+                        guard item.sessionID == creatorSessionID else { return nil }
+                        return AgentSessionDeepLinkRoute(
+                            windowID: item.windowID,
+                            workspaceID: item.workspaceID,
+                            tabID: item.tabID,
+                            sessionID: creatorSessionID
+                        )
+                    }
+            }
+        guard let route = uniqueRoute(for: creatorSessionID, candidates: candidates) else { return }
+        _ = await AppDeepLinkRouter.shared.route(agentSession: route)
+    }
+}
+
 struct AgentModeSessionsSidebarView: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let rootsStore: AgentWorkspaceRootsSidebarStore
     let agentModeVM: AgentModeViewModel
     @ObservedObject var sidebarUI: AgentSessionSidebarUIStore
@@ -83,7 +118,7 @@ struct AgentModeSessionsSidebarView: View {
 
     var body: some View {
         #if DEBUG
-            let _ = Self.recordBodyMetric()
+            let _ = recordBodyMetric()
         #endif
         VStack(spacing: 0) {
             // Search box at top
@@ -195,8 +230,8 @@ struct AgentModeSessionsSidebarView: View {
     }
 
     #if DEBUG
-        private static func recordBodyMetric() {
-            AgentModePerfDiagnostics.increment("ui.body.agentSessionsSidebar")
+        private func recordBodyMetric() {
+            perfRecorder.increment("ui.body.agentSessionsSidebar")
         }
     #endif
 
@@ -348,6 +383,7 @@ private struct BulkActionChip: View {
 }
 
 struct AgentModeSessionsListView: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let agentModeVM: AgentModeViewModel
     @ObservedObject var sidebarUI: AgentSessionSidebarUIStore
     @ObservedObject var promptManager: PromptViewModel
@@ -417,7 +453,7 @@ struct AgentModeSessionsListView: View {
 
     var body: some View {
         #if DEBUG
-            let _ = Self.recordBodyMetric()
+            let _ = recordBodyMetric()
         #endif
         // The sidebar projection intentionally does not cache exact oversight role. Reading this
         // revision makes a post-storage link projection invalidation re-evaluate the exact role below
@@ -442,7 +478,7 @@ struct AgentModeSessionsListView: View {
             renderedOrder: snapshot.renderedSelectionOrder
         )
         let defaultCollapseSeedKeys = snapshot.defaultCollapseSeedKeys
-        let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions)
+        let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions, perfRecorder: perfRecorder)
         let firstActiveSectionID = activeSections.first?.id
         let selectionState = sidebarUI.selectionState
         let showsSelectionPresentation = selectionState.showsSelectionPresentation
@@ -552,10 +588,21 @@ struct AgentModeSessionsListView: View {
                                         }
                                     }
 
+                                let creator = session.sessionID.flatMap {
+                                    agentModeVM.agentSessionLinkLaneCreator(for: $0)
+                                }
                                 AgentSessionRow(
                                     title: session.title,
                                     isActive: session.tabID == currentTabID,
                                     isOverseer: isOverseer,
+                                    createdByLabel: creator?.label,
+                                    onOpenCreator: {
+                                        guard let targetSessionID = session.sessionID,
+                                              let creatorSessionID = creator?.sessionID,
+                                              agentModeVM.agentSessionLinkLaneCreatorSessionID(for: targetSessionID) == creatorSessionID
+                                        else { return }
+                                        Task { await AgentSidebarCreatorNavigation.openIfAvailable(creatorSessionID) }
+                                    },
                                     isPinned: session.isPinned,
                                     isMCPControlled: session.isMCPControlled,
                                     runState: runState,
@@ -1045,8 +1092,8 @@ struct AgentModeSessionsListView: View {
     }
 
     #if DEBUG
-        private static func recordBodyMetric() {
-            AgentModePerfDiagnostics.increment("ui.body.agentSessionsList")
+        private func recordBodyMetric() {
+            perfRecorder.increment("ui.body.agentSessionsList")
         }
     #endif
 }
@@ -1171,10 +1218,11 @@ enum AgentSidebarDateSectionBuilder {
     static func activeSections(
         for rows: [AgentModeViewModel.SidebarSession],
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) -> [AgentSidebarActiveDateSection] {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let groups = activeGroups(for: rows, now: now, calendar: calendar)
         var sections: [AgentSidebarActiveDateSection] = []
@@ -1194,7 +1242,7 @@ enum AgentSidebarDateSectionBuilder {
             }
         }
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "sidebar.dateSections.active",
                 startMS: startMS,
                 fields: [
@@ -1247,10 +1295,11 @@ enum AgentSidebarDateSectionBuilder {
         for tabs: [StashedTab],
         now: Date = Date(),
         calendar: Calendar = .current,
-        dateInfo: (StashedTab) -> AgentModeViewModel.SidebarSessionDateInfo
+        dateInfo: (StashedTab) -> AgentModeViewModel.SidebarSessionDateInfo,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) -> [AgentSidebarArchivedDateSection] {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         var sections: [AgentSidebarArchivedDateSection] = []
         for stashed in tabs {
@@ -1277,7 +1326,7 @@ enum AgentSidebarDateSectionBuilder {
             }
         }
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "sidebar.dateSections.archived",
                 startMS: startMS,
                 fields: [
@@ -1294,6 +1343,7 @@ enum AgentSidebarDateSectionBuilder {
 // MARK: - Archived Sessions List
 
 struct ArchivedSessionsList: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let tabs: [StashedTab]
     let hasMore: Bool
     let remainingCount: Int
@@ -1340,7 +1390,8 @@ struct ArchivedSessionsList: View {
     var body: some View {
         let sections = AgentSidebarDateSectionBuilder.archivedSections(
             for: tabs,
-            dateInfo: { dateInfoByStashedTabID[$0.id] ?? agentModeVM.archivedSessionDateInfo(for: $0) }
+            dateInfo: { dateInfoByStashedTabID[$0.id] ?? agentModeVM.archivedSessionDateInfo(for: $0) },
+            perfRecorder: perfRecorder
         )
         let firstSectionID = sections.first?.id
         VStack(spacing: fontPreset.scaledClamped(2, max: 3)) {
@@ -1352,8 +1403,20 @@ struct ArchivedSessionsList: View {
                         stashedTabID: stashed.id,
                         tabID: stashed.tab.id
                     )
+                    let stashedSessionID = sessionIDByStashedTabID[stashed.id]
+                    let creator = stashedSessionID.flatMap {
+                        agentModeVM.agentSessionLinkLaneCreator(for: $0)
+                    }
                     AgentStashedSessionRow(
                         stashed: stashed,
+                        createdByLabel: creator?.label,
+                        onOpenCreator: {
+                            guard let stashedSessionID,
+                                  let creatorSessionID = creator?.sessionID,
+                                  agentModeVM.agentSessionLinkLaneCreatorSessionID(for: stashedSessionID) == creatorSessionID
+                            else { return }
+                            Task { await AgentSidebarCreatorNavigation.openIfAvailable(creatorSessionID) }
+                        },
                         isSelected: selectionState.selectedIdentities.contains(identity),
                         showsSelectionPresentation: selectionState.showsSelectionPresentation,
                         isInteractionEnabled: !selectionState.isMutationInFlight,

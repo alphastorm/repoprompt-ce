@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 
 // Restores durable oversight intents into live links after launch and window restore.
 //
@@ -162,6 +163,12 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
 /// silently reappear.
 @MainActor
 final class AgentSessionOversightLaunchCoordinator {
+    private var restorePerfRecorder: any WorkspaceRestorePerfRecording
+
+    func installRestorePerfRecorder(_ recorder: any WorkspaceRestorePerfRecording) {
+        restorePerfRecorder = recorder
+    }
+
     // MARK: Entry state
 
     enum EntryState: Equatable {
@@ -233,8 +240,12 @@ final class AgentSessionOversightLaunchCoordinator {
     /// a load that ends terminal must not be retried in a loop, and the pass re-runs on every event.
     private var hydrationRequestedSessionIDs: Set<UUID> = []
 
-    init(delegate: (any AgentSessionOversightLaunchCoordinatorDelegate)? = nil) {
+    init(
+        delegate: (any AgentSessionOversightLaunchCoordinatorDelegate)? = nil,
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
+    ) {
         self.delegate = delegate
+        self.restorePerfRecorder = restorePerfRecorder
     }
 
     func attach(delegate: any AgentSessionOversightLaunchCoordinatorDelegate) {
@@ -270,7 +281,7 @@ final class AgentSessionOversightLaunchCoordinator {
         guard topology != state else { return }
         topology = state
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.topology",
                 fields: [
                     "state": state.diagnosticLabel,
@@ -444,7 +455,7 @@ final class AgentSessionOversightLaunchCoordinator {
         }
         #if DEBUG
             let stillPending = pendingCleanupCount
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.cleanupRetry",
                 fields: [
                     "attempted": String(attempted),
@@ -477,7 +488,7 @@ final class AgentSessionOversightLaunchCoordinator {
         private func logDiscoveryPendingOnce(_ discovery: [AgentSessionLinkDiscoveryState]) {
             guard !launchPairOrder.isEmpty, !didLogDiscoveryPending else { return }
             didLogDiscoveryPending = true
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.discovery",
                 fields: [
                     "state": "pending",
@@ -504,11 +515,11 @@ final class AgentSessionOversightLaunchCoordinator {
         ) {
             var fields = [
                 "outcome": outcome,
-                "observer": WorkspaceRestorePerfLog.shortID(pair.observerSessionID),
-                "target": WorkspaceRestorePerfLog.shortID(pair.targetSessionID)
+                "observer": restorePerfRecorder.shortID(pair.observerSessionID),
+                "target": restorePerfRecorder.shortID(pair.targetSessionID)
             ]
             if let reason { fields["reason"] = reason }
-            WorkspaceRestorePerfLog.event("oversight.reconcile", fields: fields)
+            restorePerfRecorder.event("oversight.reconcile", fields: fields)
         }
     #endif
 
@@ -658,7 +669,7 @@ final class AgentSessionOversightLaunchCoordinator {
         guard !requested.isEmpty else { return }
         hydrationRequestedSessionIDs.formUnion(requested)
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.hydrationRequested",
                 fields: ["sessions": String(requested.count)]
             )

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcess
 
 struct GrokBuildACPAgentProvider: ACPAgentProvider {
     private let config: GrokBuildAgentConfig

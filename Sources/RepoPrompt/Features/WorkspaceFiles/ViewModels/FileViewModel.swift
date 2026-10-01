@@ -1,6 +1,8 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 // MARK: - SVG-Safe Preview Types
 

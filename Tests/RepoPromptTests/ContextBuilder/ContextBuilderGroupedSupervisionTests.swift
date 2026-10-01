@@ -270,10 +270,14 @@ import XCTest
             try await withHarness { harness in
                 var rejected: ContextBuilderOracleLaneScope?
                 let oracle = harness.driver.window.oracleViewModel
+                defer { if let rejected { oracle.unpinSession(rejected.sessionID) } }
                 oracle.contextBuilderBeforeAvailabilityForTesting = { scope, model in
                     // This is AFTER actual UI resolution/validation, at sendMessage's own late branch.
                     harness.driver.window.apiSettingsViewModel.isOpenAIKeyValid = model != .gpt54Mini
-                    if model == .gpt54Mini { rejected = scope }
+                    if model == .gpt54Mini {
+                        rejected = scope
+                        oracle.pinSession(scope.sessionID) // Resident, as a displayed or recently viewed chat.
+                    }
                 }
                 try harness.startUI()
                 try await harness.waitForStream(.gpt54)
@@ -288,6 +292,12 @@ import XCTest
                 XCTAssertEqual(harness.uiReply?.oracleGroup?.result.oracleResults.map(\.status), [.failed, .completed])
                 let error = try XCTUnwrap(harness.uiReply?.oracleGroup?.result.oracleResults.first?.error)
                 XCTAssertTrue(error.message.contains("not available"))
+                // Opening the lane chat must not show the failed send's MCP mode/model/preset label.
+                XCTAssertTrue(oracle.isSessionPinnedForTesting(scope.sessionID))
+                oracle.currentSessionID = scope.sessionID
+                XCTAssertNil(oracle.mcpModelInfo)
+                XCTAssertNil(oracle.mcpOverrideModelName)
+                XCTAssertNil(oracle.mcpOverrideChatPresetName)
             }
         }
 
@@ -321,6 +331,147 @@ import XCTest
                     oracle.messagesSnapshot(for: scope.sessionID).map(\.id), [],
                     "A refused bind must leave the fresh lane chat empty"
                 )
+                // Opening the lane chat must not show the refused send's MCP mode/model/preset label.
+                oracle.currentSessionID = scope.sessionID
+                XCTAssertNil(oracle.mcpModelInfo)
+                XCTAssertNil(oracle.mcpOverrideModelName)
+                XCTAssertNil(oracle.mcpOverrideChatPresetName)
+            }
+        }
+
+        func testCancelledLaneWithLateUnavailableModelLeavesNoTurns() async throws {
+            try await withHarness { harness in
+                var cancelled: ContextBuilderOracleLaneScope?
+                let oracle = harness.driver.window.oracleViewModel
+                defer { if let cancelled { oracle.unpinSession(cancelled.sessionID) } }
+                oracle.contextBuilderBeforeAvailabilityForTesting = { scope, model in
+                    // The lane is revoked after its user turn exists, just before the late availability branch.
+                    harness.driver.window.apiSettingsViewModel.isOpenAIKeyValid = model != .gpt54Mini
+                    guard model == .gpt54Mini else { return }
+                    cancelled = scope
+                    oracle.pinSession(scope.sessionID) // Resident, as a displayed or recently viewed chat.
+                    scope.cancellation.request()
+                }
+                try harness.startUI()
+                try await harness.waitForStream(.gpt54)
+                harness.complete(.gpt54, text: "available sibling")
+                try await harness.wait(harness.settled)
+                XCTAssertNil(harness.error)
+                let scope = try XCTUnwrap(cancelled)
+                XCTAssertNil(scope.queryID)
+                XCTAssertTrue(scope.hasDrainedForTesting)
+                XCTAssertEqual(harness.registeredModels, [.gpt54])
+                XCTAssertEqual(harness.uiReply?.oracleGroup?.result.oracleResults.map(\.status), [.cancelled, .completed])
+                XCTAssertTrue(oracle.isSessionPinnedForTesting(scope.sessionID))
+                XCTAssertEqual(
+                    oracle.messagesSnapshot(for: scope.sessionID).map(\.id), [],
+                    "A revoked lane must keep no user turn and add no unavailable-model error turn"
+                )
+            }
+        }
+
+        func testExpiredLaneLinksTheBackgroundTabItAlreadyCreated() async throws {
+            try await withHarness { harness in
+                let oracle = harness.driver.window.oracleViewModel
+                let manager = harness.driver.manager
+                let name = "Lane chat \(UUID().uuidString)"
+                let session = ChatSession(composeTabID: UUID(), name: name) // Its tab no longer exists.
+                oracle.sessions.append(session)
+                // The lane expires exactly once ensureTabForSession's background tab exists.
+                let group = ContextBuilderOracleGroupSupervision(clock: {
+                    manager.workspaces.contains { $0.composeTabs.contains { $0.name == name } } ? 10000 : 0
+                })
+                let lane = group.makeLane(sessionID: session.id)
+                _ = await oracle.ensureTabForSession(session, contextBuilderScope: lane)
+                XCTAssertFalse(lane.isLive)
+                let created = manager.workspaces.flatMap(\.composeTabs).filter { $0.name == name }
+                XCTAssertEqual(created.count, 1)
+                XCTAssertEqual(
+                    oracle.sessions.first { $0.id == session.id }?.composeTabID, created.first?.id,
+                    "A tab created for the lane chat must not be left unlinked"
+                )
+            }
+        }
+
+        func testTimedOutOrCancelledLanePersistsItsAdmittedPartial() async throws {
+            // A silent lane keeps its dispatched user turn but, like an ordinary cancel, no empty assistant turn.
+            let cases: [(stop: String, partial: String?)] = [("timeout", "partial "), ("cancel", "partial "), ("silent timeout", nil)]
+            for (stop, partial) in cases {
+                try await withHarness { harness in
+                    var primary: ContextBuilderOracleLaneScope?
+                    let oracle = harness.driver.window.oracleViewModel
+                    oracle.contextBuilderBeforeChatResolutionForTesting = { scope, model in
+                        if model == .gpt54Mini { primary = scope }
+                    }
+                    try harness.startUI()
+                    try await harness.waitForStreams()
+                    if let partial { try await harness.emit(.gpt54Mini, text: partial) }
+                    harness.complete(.gpt54, text: "sibling")
+                    let scope = try XCTUnwrap(primary, stop)
+                    var frozen: ChatSession?
+                    if partial == nil {
+                        // Show the silent lane's chat on the active tab with different live controls, so a save
+                        // that took live prompt state would overwrite what tool_chatSend froze for the lane.
+                        let lane = try XCTUnwrap(oracle.sessions.first { $0.id == scope.sessionID }, stop)
+                        frozen = lane
+                        oracle.currentSessionID = scope.sessionID
+                        oracle.promptViewModel.restorePreferredModelForSession(AIModel.gpt54.rawValue)
+                        oracle.promptViewModel.selectedChatPresetID = lane.selectedChatPresetID == ChatPreset.BuiltIn.chat.id
+                            ? ChatPreset.BuiltIn.plan.id : ChatPreset.BuiltIn.chat.id
+                        XCTAssertTrue(OracleViewModel.shouldUseLivePromptStateForAutosave(
+                            sessionID: scope.sessionID, currentSessionID: oracle.currentSessionID,
+                            sessionComposeTabID: lane.composeTabID, activeComposeTabID: oracle.promptViewModel.activeComposeTabID
+                        ), "\(stop): the lane chat is current on the active tab")
+                        XCTAssertNotEqual(oracle.promptViewModel.preferredModel, lane.preferredAIModel, stop)
+                        XCTAssertNotEqual(oracle.promptViewModel.selectedChatPresetID, lane.selectedChatPresetID, stop)
+                    }
+                    if stop == "cancel" {
+                        await oracle.cancelAIResponse(in: scope.sessionID)
+                    } else {
+                        try await harness.clock.waitForSleep(5)
+                        harness.clock.advance(to: 605)
+                    }
+                    try await harness.wait(harness.settled)
+                    XCTAssertNil(harness.error, stop)
+                    let result = try XCTUnwrap(harness.uiReply?.oracleGroup?.result.oracleResults.first, stop)
+                    XCTAssertEqual(result.status, stop == "cancel" ? .cancelled : .failed, stop)
+                    XCTAssertEqual(result.error?.partialResponse, partial, "\(stop): the admitted partial")
+                    // Read the saved chat back from disk, independent of what is still in memory.
+                    let session = try XCTUnwrap(oracle.sessions.first { $0.id == scope.sessionID }, stop)
+                    try await oracle.drainTrackedAutosaves(for: XCTUnwrap(session.workspaceID, stop))
+                    let saved = try await oracle.chatData.loadChatSession(from: XCTUnwrap(session.fileURL, stop))
+                    XCTAssertEqual(saved.messages.map(\.isUser), partial == nil ? [true] : [true, false], "\(stop): saved turns")
+                    XCTAssertEqual(saved.messages.last { !$0.isUser }?.rawText, partial, "\(stop): saved partial")
+                    if let frozen {
+                        XCTAssertEqual(saved.preferredAIModel, frozen.preferredAIModel, "\(stop): saved model")
+                        XCTAssertEqual(saved.selectedChatPresetID, frozen.selectedChatPresetID, "\(stop): saved preset")
+                    }
+                }
+            }
+        }
+
+        func testDeletingCancelledLaneChatAfterGroupSettlesLeavesNoChatFile() async throws {
+            try await withHarness { harness in
+                var primary: ContextBuilderOracleLaneScope?
+                let oracle = harness.driver.window.oracleViewModel
+                oracle.contextBuilderBeforeChatResolutionForTesting = { scope, model in
+                    if model == .gpt54Mini { primary = scope }
+                }
+                try harness.startUI()
+                try await harness.waitForStreams()
+                try await harness.emit(.gpt54Mini, text: "partial ")
+                harness.complete(.gpt54, text: "sibling")
+                let scope = try XCTUnwrap(primary)
+                // Cancelling queues the lane's release save; a running group can't be deleted, so delete once settled.
+                await oracle.cancelAIResponse(in: scope.sessionID)
+                try await harness.wait(harness.settled)
+                let session = try XCTUnwrap(oracle.sessions.first { $0.id == scope.sessionID })
+                let workspace = try XCTUnwrap(harness.driver.manager.workspaces.first { $0.id == session.workspaceID })
+                await oracle.deleteSession(session)
+                await oracle.drainTrackedAutosaves(for: workspace.id)
+                XCTAssertNil(oracle.sessionOperationError)
+                let files = try await oracle.chatData.listChatSessions(for: workspace).map(\.lastPathComponent)
+                XCTAssertFalse(files.contains("ChatSession-\(session.id.uuidString).json"), "A deleted lane chat's file came back")
             }
         }
 

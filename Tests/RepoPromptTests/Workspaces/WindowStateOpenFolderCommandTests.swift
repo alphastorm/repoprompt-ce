@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptWorkspaceCore
 import XCTest
 
 #if DEBUG

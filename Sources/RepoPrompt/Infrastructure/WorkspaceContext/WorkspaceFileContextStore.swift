@@ -3,6 +3,9 @@ import CoreServices
 import Dispatch
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptWorkspaceCore
 #if DEBUG
     import CryptoKit
 #endif
@@ -183,6 +186,9 @@ struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
 }
 
 actor WorkspaceFileContextStore {
+    private let restorePerfRecorder: any WorkspaceRestorePerfRecording
+    let perfRecorder: any AgentModePerfRecording
+
     enum CodemapGraphIndexBuildStoreEventKind: String, Hashable {
         case rootInventoryAndSearchReady
         case scheduled
@@ -3311,7 +3317,9 @@ actor WorkspaceFileContextStore {
             ) async -> WorkspaceCodemapBindingDemandResult = { _, result in result },
             codemapAutomaticSelectionQueryHook: @escaping @Sendable (
                 WorkspaceCodemapRootEpoch
-            ) async -> Void = { _ in }
+            ) async -> Void = { _ in },
+            restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
+            perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
         ) {
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.debugNowNanoseconds = debugNowNanoseconds
@@ -3332,6 +3340,8 @@ actor WorkspaceFileContextStore {
             self.codemapGraphPublicationWaiter = codemapGraphPublicationWaiter
             self.codemapDemandResultHook = codemapDemandResultHook
             self.codemapAutomaticSelectionQueryHook = codemapAutomaticSelectionQueryHook
+            self.restorePerfRecorder = restorePerfRecorder
+            self.perfRecorder = perfRecorder
             isCatalogShardShadowValidationEnabled = enableCatalogShardShadowValidation
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator(debugNowNanoseconds: debugNowNanoseconds)
             #if os(macOS)
@@ -3380,7 +3390,9 @@ actor WorkspaceFileContextStore {
             ) async -> WorkspaceCodemapBindingDemandResult = { _, result in result },
             codemapAutomaticSelectionQueryHook: @escaping @Sendable (
                 WorkspaceCodemapRootEpoch
-            ) async -> Void = { _ in }
+            ) async -> Void = { _ in },
+            restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
+            perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
         ) {
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.unloadTerminationPolicy = unloadTerminationPolicy
@@ -3399,6 +3411,8 @@ actor WorkspaceFileContextStore {
             self.codemapGraphPublicationWaiter = codemapGraphPublicationWaiter
             self.codemapDemandResultHook = codemapDemandResultHook
             self.codemapAutomaticSelectionQueryHook = codemapAutomaticSelectionQueryHook
+            self.restorePerfRecorder = restorePerfRecorder
+            self.perfRecorder = perfRecorder
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator()
             #if os(macOS)
                 let source = DispatchSource.makeMemoryPressureSource(
@@ -11091,7 +11105,7 @@ actor WorkspaceFileContextStore {
     ) async throws -> WorkspaceRootRecord {
         let standardizedPath = (path as NSString).standardizingPath
         #if DEBUG
-            let rootLoadRouteStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let rootLoadRouteStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let rootLoadName = URL(fileURLWithPath: standardizedPath).lastPathComponent
         #endif
         try Task.checkCancellation()
@@ -11124,13 +11138,13 @@ actor WorkspaceFileContextStore {
                 throw WorkspaceFileContextStoreError.rootAlreadyLoadedWithDifferentConfiguration(standardizedPath)
             }
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "store.rootLoad.existing",
                     fields: [
                         "rootName": rootLoadName,
-                        "rootID": WorkspaceRestorePerfLog.shortID(existing.id),
+                        "rootID": restorePerfRecorder.shortID(existing.id),
                         "kind": "\(loadConfiguration.kind)",
-                        "duration": rootLoadRouteStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": rootLoadRouteStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -11148,7 +11162,7 @@ actor WorkspaceFileContextStore {
                 )
             }
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "store.rootLoad.joinInFlight",
                     fields: [
                         "rootName": rootLoadName,
@@ -11168,7 +11182,7 @@ actor WorkspaceFileContextStore {
         }
 
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootLoad.scheduled",
                 fields: [
                     "rootName": rootLoadName,
@@ -11336,8 +11350,8 @@ actor WorkspaceFileContextStore {
 
         let rootURL = URL(fileURLWithPath: standardizedPath).standardizedFileURL
         #if DEBUG
-            let performLoadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-            WorkspaceRestorePerfLog.event(
+            let performLoadStartMS = restorePerfRecorder.timestampMSIfEnabled()
+            restorePerfRecorder.event(
                 "store.rootLoad.begin",
                 fields: [
                     "rootName": rootURL.lastPathComponent,
@@ -11369,15 +11383,15 @@ actor WorkspaceFileContextStore {
         #if DEBUG
             var rootRecordCreatedFields: [String: String] = [
                 "rootName": root.name,
-                "rootID": WorkspaceRestorePerfLog.shortID(root.id),
+                "rootID": restorePerfRecorder.shortID(root.id),
                 "kind": "\(root.kind)",
-                "durationSinceStoreRootLoadBegin": performLoadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                "durationSinceStoreRootLoadBegin": performLoadStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
             ]
             rootRecordCreatedFields.merge(
                 WorkspaceRootLoadDiagnostics.rootRecordCreatedFields(forPath: standardizedPath),
                 uniquingKeysWith: { _, diagnostic in diagnostic }
             )
-            WorkspaceRestorePerfLog.event("store.rootLoad.rootRecordCreated", fields: rootRecordCreatedFields)
+            restorePerfRecorder.event("store.rootLoad.rootRecordCreated", fields: rootRecordCreatedFields)
         #endif
 
         var state = RootState(
@@ -11405,7 +11419,7 @@ actor WorkspaceFileContextStore {
 
         #if DEBUG
             let coldStartWalkStart = WorkspaceFileSearchDebugTiming.now()
-            let walkStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let walkStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var chunkCount = 0
         #endif
         for try await event in await service.loadContentsInChunks(of: rootURL) {
@@ -11416,16 +11430,16 @@ actor WorkspaceFileContextStore {
                 if chunkCount == 1 {
                     var firstChunkFields: [String: String] = [
                         "rootName": root.name,
-                        "rootID": WorkspaceRestorePerfLog.shortID(root.id),
+                        "rootID": restorePerfRecorder.shortID(root.id),
                         "chunkFolders": "\(chunk.folders.count)",
                         "chunkFiles": "\(chunk.files.count)",
-                        "durationSinceStoreRootLoadBegin": performLoadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "durationSinceStoreRootLoadBegin": performLoadStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                     firstChunkFields.merge(
                         WorkspaceRootLoadDiagnostics.firstPreparedChunkFields(forPath: standardizedPath),
                         uniquingKeysWith: { _, diagnostic in diagnostic }
                     )
-                    WorkspaceRestorePerfLog.event("store.rootLoad.firstPreparedChunk", fields: firstChunkFields)
+                    restorePerfRecorder.event("store.rootLoad.firstPreparedChunk", fields: firstChunkFields)
                 }
             #endif
             indexFolders(chunk.folders, root: root, state: &state, indexes: &stagedIndexes)
@@ -11441,28 +11455,28 @@ actor WorkspaceFileContextStore {
                 files: stagedIndexes.filesByID.count,
                 folders: stagedIndexes.foldersByID.count
             )
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootLoad.walk",
                 fields: [
                     "rootName": root.name,
                     "chunkCount": "\(chunkCount)",
                     "folders": "\(stagedIndexes.foldersByID.count)",
                     "files": "\(stagedIndexes.filesByID.count)",
-                    "duration": walkStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": walkStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
-            let commitStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let commitStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
 
         commit(stagedIndexes)
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootLoad.commit",
                 fields: [
                     "rootName": root.name,
                     "folders": "\(stagedIndexes.foldersByID.count)",
                     "files": "\(stagedIndexes.filesByID.count)",
-                    "duration": commitStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": commitStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -11506,14 +11520,14 @@ actor WorkspaceFileContextStore {
         publishCodemapRootStatusesIfChanged()
         scheduleCodemapGraphIndexBuildAfterRootReady(rootEpoch: rootEpoch)
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootLoad.end",
                 fields: [
                     "rootName": root.name,
-                    "rootID": WorkspaceRestorePerfLog.shortID(root.id),
+                    "rootID": restorePerfRecorder.shortID(root.id),
                     "folders": "\(stagedIndexes.foldersByID.count)",
                     "files": "\(stagedIndexes.filesByID.count)",
-                    "duration": performLoadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": performLoadStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -11794,10 +11808,10 @@ actor WorkspaceFileContextStore {
             await interactiveReadCache.invalidate(rootID: entry.rootID)
         }
         #if DEBUG
-            let rootUnloadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let rootUnloadStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let rootUnloadFolderCount = statesToUnload.reduce(0) { $0 + $1.state.folderIDsByRelativePath.count }
             let rootUnloadFileCount = statesToUnload.reduce(0) { $0 + $1.state.fileIDsByRelativePath.count }
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootUnload.begin",
                 fields: [
                     "rootCount": "\(statesToUnload.count)",
@@ -11805,7 +11819,7 @@ actor WorkspaceFileContextStore {
                     "fileCount": "\(rootUnloadFileCount)"
                 ]
             )
-            let detachStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let detachStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
 
         let unloadingPaths = statesToUnload.map(\.state.root.standardizedFullPath)
@@ -11834,14 +11848,14 @@ actor WorkspaceFileContextStore {
             ))
         }
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootUnload.detach",
                 fields: [
                     "rootCount": "\(statesToUnload.count)",
-                    "duration": detachStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": detachStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
-            let stopWatchersStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let stopWatchersStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
 
         // Stop each detached service exactly once. The caller only waits through a bounded
@@ -11873,14 +11887,14 @@ actor WorkspaceFileContextStore {
             }
         #endif
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootUnload.stopWatchers",
                 fields: [
                     "rootCount": "\(statesToUnload.count)",
-                    "duration": stopWatchersStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": stopWatchersStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
-            let indexCleanupStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let indexCleanupStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
 
         for entry in statesToUnload {
@@ -11935,13 +11949,13 @@ actor WorkspaceFileContextStore {
         }
 
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootUnload.indexCleanup",
                 fields: [
                     "rootCount": "\(statesToUnload.count)",
                     "removedFolders": "\(rootUnloadFolderCount)",
                     "removedFiles": "\(rootUnloadFileCount)",
-                    "duration": indexCleanupStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": indexCleanupStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -11964,11 +11978,11 @@ actor WorkspaceFileContextStore {
             }
         ))
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "store.rootUnload.end",
                 fields: [
                     "rootCount": "\(statesToUnload.count)",
-                    "duration": rootUnloadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": rootUnloadStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif

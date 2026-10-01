@@ -18,8 +18,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         hasUnreadActivity: Bool = false,
         targetRoute: AgentSessionDeepLinkRoute? = nil,
         autoWakeSnooze: AgentMonitorAutoWakeSnoozeState? = nil,
-        isAutoWakeEffectivelySelected: Bool = false,
-        autoApprovalEnabled: Bool = false
+        isAutoWakeEffectivelySelected: Bool = false
     ) -> AgentMonitorPillProps.Outbound {
         AgentMonitorPillProps.Outbound(
             linkID: UUID(),
@@ -34,8 +33,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             hasUnreadActivity: hasUnreadActivity,
             targetRoute: targetRoute,
             autoWakeSnooze: autoWakeSnooze,
-            isAutoWakeEffectivelySelected: isAutoWakeEffectivelySelected,
-            autoApprovalEnabled: autoApprovalEnabled
+            isAutoWakeEffectivelySelected: isAutoWakeEffectivelySelected
         )
     }
 
@@ -478,15 +476,6 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertTrue(settled.canAdd)
     }
 
-    func testAutoApprovalIsOffByDefaultAndSurvivesPresentationOverlay() {
-        XCTAssertFalse(outbound().autoApprovalEnabled)
-        let selected = outbound(autoApprovalEnabled: true)
-        XCTAssertTrue(selected.withAutoWakeState(snooze: nil, isEffectivelySelected: true).autoApprovalEnabled)
-        let props = makeProps(outbound: [selected])
-        XCTAssertTrue(props.withCanAddReason("changed").outbound[0].autoApprovalEnabled)
-        XCTAssertTrue(props.withPersistence(.noDurableLayer, eligibilityReason: nil).outbound[0].autoApprovalEnabled)
-    }
-
     func testOverlayPreservesAuthoritativeLinkAndNoticeProjection() {
         // Only eligibility is recomputed; link membership, unread, and notices stay authority-owned.
         // A copy helper that dropped unread would silently clear a signal the user has not acknowledged.
@@ -904,6 +893,17 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertTrue(AgentMonitorUnlinkUndo.undoTooltip.contains("new oversight link"))
         XCTAssertTrue(AgentMonitorUnlinkUndo.undoTooltip.contains("Unread"))
         XCTAssertEqual(AgentMonitorUnlinkUndo.window, .seconds(8))
+    }
+
+    // MARK: - Oversight boundary copy
+
+    /// The popover's only remaining help copy is the authority boundary on the Oversee session
+    /// button's tooltip: what the link grants is no longer spelled out on screen.
+    func testOversightDisclosureIsOnlyTheAuthorityBoundary() {
+        XCTAssertEqual(
+            AgentMonitorOversightDisclosure.boundary,
+            "Session-wide approvals, hook trust, merge reviews, and secret inputs stay with you."
+        )
     }
 
     // MARK: - Notices

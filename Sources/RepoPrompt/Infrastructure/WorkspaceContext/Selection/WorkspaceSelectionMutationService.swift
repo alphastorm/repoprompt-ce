@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 struct WorkspaceSelectionSliceInput: Equatable {
     let path: String

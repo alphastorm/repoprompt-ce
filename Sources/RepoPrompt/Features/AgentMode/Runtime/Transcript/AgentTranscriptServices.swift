@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import OSLog
+import RepoPromptInstrumentation
 
 enum AgentConversationReplayMode: String, Equatable {
     case equivalent
@@ -3128,10 +3129,11 @@ enum AgentTranscriptIO {
 
     static func buildConversationHistory(
         from transcript: AgentTranscript,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
         renderUserMessage: ((AgentTranscriptRequestAnchor) -> String)? = nil
     ) -> String {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let serialization = serializeConversationHistory(
             from: transcript,
@@ -3139,10 +3141,38 @@ enum AgentTranscriptIO {
             policy: .equivalent
         )
         #if DEBUG
-            AgentModePerfDiagnostics.recordConversationReplay(
-                serialization.metrics,
-                startMS: startMS
-            )
+            if perfRecorder.isEnabled {
+                let metrics = serialization.metrics
+                var fields: [String: String] = [
+                    "mode": metrics.mode.rawValue,
+                    "turnCount": String(metrics.turnCount),
+                    "examinedRowCount": String(metrics.examinedRowCount),
+                    "unboundedOutputUTF8Bytes": String(metrics.unboundedOutputUTF8Bytes),
+                    "outputUTF8Bytes": String(metrics.outputUTF8Bytes),
+                    "userAuthoredUTF8Bytes": String(metrics.userAuthoredUTF8Bytes),
+                    "originalToolArgumentCharacters": String(metrics.originalToolArgumentCharacters),
+                    "emittedToolArgumentCharacters": String(metrics.emittedToolArgumentCharacters),
+                    "truncatedToolCallCount": String(metrics.truncatedToolCallCount),
+                    "omittedRowCount": String(metrics.omittedRowCount),
+                    "essentialOverflowUTF8Bytes": String(metrics.essentialOverflowUTF8Bytes),
+                    "finalOverBudgetUTF8Bytes": String(metrics.finalOverBudgetUTF8Bytes)
+                ]
+                for category in AgentConversationReplayCategory.allCases {
+                    let categoryMetrics = metrics.categories[category] ?? .init()
+                    fields["\(category.rawValue).examined"] = String(categoryMetrics.examinedCount)
+                    fields["\(category.rawValue).emitted"] = String(categoryMetrics.emittedCount)
+                    fields["\(category.rawValue).omitted"] = String(categoryMetrics.omittedCount)
+                    fields["\(category.rawValue).unboundedUTF8Bytes"] = String(categoryMetrics.unboundedUTF8Bytes)
+                    fields["\(category.rawValue).emittedUTF8Bytes"] = String(categoryMetrics.emittedUTF8Bytes)
+                }
+                perfRecorder.recordConversationReplay(.init(
+                    mode: metrics.mode.rawValue,
+                    fields: fields,
+                    truncatedToolCallCount: metrics.truncatedToolCallCount,
+                    omittedRowCount: metrics.omittedRowCount,
+                    essentialOverflowUTF8Bytes: metrics.essentialOverflowUTF8Bytes
+                ), startMS: startMS)
+            }
         #endif
         return serialization.text
     }

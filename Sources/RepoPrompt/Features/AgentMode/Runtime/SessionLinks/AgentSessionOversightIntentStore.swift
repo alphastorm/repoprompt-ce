@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptInstrumentation
 
 // Durable oversight intents: the user's directed overseer → overseen relationships and nothing else.
 //
@@ -8,16 +9,14 @@ import Foundation
 // writes them on link creation and removal. Invariants: the durable payload carries no link IDs,
 // generations, endpoint incarnations, or Auto-wake/snooze state — those are process-local and are
 // re-derived on restore — and every mutation is token-fenced so a stale attempt cannot overwrite a
-// newer document. The one piece of authority it does carry is the user's own per-pair delegation
-// (management and permission auto-approval): it is recorded only from an explicit user toggle,
-// dropped with its pair, and re-applied through the ordinary eligibility-checked setters against the
-// fresh grant a restore creates — never inherited by a different pair or trusted without that check.
+// newer document. Legacy delegation fields are ignored; live grants derive their capabilities from
+// current authority defaults, never from UUID-keyed saved data.
 
 // MARK: - Durable model
 
 /// One directed overseer → overseen relationship the user explicitly created.
 ///
-/// Together with its optional `AgentSessionOversightDelegation`, this is the **entire** durable
+/// Together with the document version, this is the **entire** durable
 /// payload. Link IDs, generations, endpoint incarnations, binding generations, reservations,
 /// observations, cursors, waiters, prompt inventories, and delivery state stay process-local in
 /// `DomainAgentSessionLinkAuthority` and are never written to disk.
@@ -44,66 +43,17 @@ struct AgentSessionOversightIntent: Codable, Hashable {
     }
 }
 
-/// The user's explicit per-pair delegation on top of plain oversight.
-///
-/// Recorded only when the user toggles it on a live link, removed together with its pair, and
-/// re-applied to the *fresh* grant a restore (or an Add of a still-saved pair) creates — always
-/// through the same eligibility-checked setters the toggle uses, so a relaunch can never grant more
-/// than the user last granted this exact observer → target pair.
-struct AgentSessionOversightDelegation: Hashable {
-    /// The observer may manage (steer, answer) the target.
-    var manage = false
-    /// The target's provider permission prompts are approved on the observer's behalf.
-    var autoApprovePermissions = false
-
-    static let none = AgentSessionOversightDelegation()
-
-    var isEmpty: Bool {
-        !manage && !autoApprovePermissions
-    }
-}
-
-/// One on-disk delegation row. Only honoured when its pair is also present in `links`.
-struct AgentSessionOversightDelegationRecord: Codable, Hashable {
-    let observerSessionID: UUID
-    let targetSessionID: UUID
-    /// Optional so a future field can be added without breaking older decoders, and so an absent
-    /// value reads as "not delegated".
-    var manage: Bool?
-    var autoApprovePermissions: Bool?
-
-    var pair: AgentSessionOversightIntent {
-        AgentSessionOversightIntent(observerSessionID: observerSessionID, targetSessionID: targetSessionID)
-    }
-
-    var delegation: AgentSessionOversightDelegation {
-        AgentSessionOversightDelegation(
-            manage: manage ?? false,
-            autoApprovePermissions: autoApprovePermissions ?? false
-        )
-    }
-}
-
-/// Versioned on-disk envelope.
-///
-/// Version 1 carries the directed UUID pairs plus an optional, additive `delegations` array. The
-/// array is omitted when empty, so a document with no delegation is byte-identical to the original
-/// format; an older build ignores the unknown key and still loads every pair.
+/// Versioned on-disk envelope. Swift's synthesized decoder ignores the legacy `delegations`
+/// key while retaining the directed `links`, and every subsequent write omits that key.
 struct AgentSessionOversightIntentDocument: Codable {
     static let currentVersion = 1
 
     let version: Int
     let links: [AgentSessionOversightIntent]
-    let delegations: [AgentSessionOversightDelegationRecord]?
 
-    init(
-        version: Int = AgentSessionOversightIntentDocument.currentVersion,
-        links: [AgentSessionOversightIntent],
-        delegations: [AgentSessionOversightDelegationRecord]? = nil
-    ) {
+    init(version: Int = AgentSessionOversightIntentDocument.currentVersion, links: [AgentSessionOversightIntent]) {
         self.version = version
         self.links = links
-        self.delegations = delegations
     }
 }
 
@@ -195,8 +145,6 @@ struct AgentSessionOversightIntentReadyLoad: Equatable {
     let source: Source
     let storeRevision: UInt64
     let tokenByPair: [AgentSessionOversightIntent: AgentSessionOversightIntentToken]
-    /// Saved delegation for loaded pairs. Pairs with none are absent.
-    var delegationByPair: [AgentSessionOversightIntent: AgentSessionOversightDelegation] = [:]
 
     var pairs: Set<AgentSessionOversightIntent> {
         Set(tokenByPair.keys)
@@ -290,6 +238,7 @@ actor AgentSessionOversightIntentStore {
     static let maxDecodedRowCount = 65536
     private static let maxQuarantineAttempts = 4
 
+    private let restorePerfRecorder: any WorkspaceRestorePerfRecording
     private let fileURL: URL
     private let backupsDirectoryURL: URL
     private let mode: AgentSessionOversightPersistenceMode
@@ -311,9 +260,6 @@ actor AgentSessionOversightIntentStore {
     private var settledSource: AgentSessionOversightIntentReadyLoad.Source?
     private var blockReason: AgentSessionOversightPersistenceBlockReason?
     private var tokenByPair: [AgentSessionOversightIntent: AgentSessionOversightIntentToken] = [:]
-    /// The user's saved delegation per present pair. Invariant: every key is also in `tokenByPair`,
-    /// and no value is empty.
-    private var delegationByPair: [AgentSessionOversightIntent: AgentSessionOversightDelegation] = [:]
     /// How many times each pair has been *asserted* in this process. Monotonic and never reset, not
     /// even by a removal.
     ///
@@ -337,8 +283,10 @@ actor AgentSessionOversightIntentStore {
         makeUUID: @escaping @Sendable () -> UUID = UUID.init,
         storeProcessGeneration: UUID = UUID(),
         maxFileByteCount: Int = AgentSessionOversightIntentStore.maxFileByteCount,
-        maxDecodedRowCount: Int = AgentSessionOversightIntentStore.maxDecodedRowCount
+        maxDecodedRowCount: Int = AgentSessionOversightIntentStore.maxDecodedRowCount,
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
     ) {
+        self.restorePerfRecorder = restorePerfRecorder
         self.fileURL = fileURL
         self.backupsDirectoryURL = backupsDirectoryURL
         self.mode = mode
@@ -354,7 +302,8 @@ actor AgentSessionOversightIntentStore {
     /// Production location, beside `windowSessions.json`.
     static func production(
         mode: AgentSessionOversightPersistenceMode,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
     ) -> AgentSessionOversightIntentStore {
         let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first!
@@ -363,7 +312,8 @@ actor AgentSessionOversightIntentStore {
             fileURL: base.appendingPathComponent(filename),
             backupsDirectoryURL: base.appendingPathComponent(backupsDirectoryName, isDirectory: true),
             mode: mode,
-            fileManager: fileManager
+            fileManager: fileManager,
+            restorePerfRecorder: restorePerfRecorder
         )
     }
 
@@ -432,14 +382,6 @@ actor AgentSessionOversightIntentStore {
             guard tokenByPair[pair] == nil else { continue }
             tokenByPair[pair] = mintToken(for: pair)
         }
-        // A delegation row is honoured only for a pair that is itself present: an orphaned row is
-        // an authorization with no relationship behind it.
-        for record in document.delegations ?? [] {
-            let pair = record.pair
-            let delegation = record.delegation
-            guard tokenByPair[pair] != nil, !delegation.isEmpty else { continue }
-            delegationByPair[pair] = delegation
-        }
         return .ready(readyLoad(source: .loaded))
     }
 
@@ -494,8 +436,7 @@ actor AgentSessionOversightIntentStore {
         return AgentSessionOversightIntentReadyLoad(
             source: source,
             storeRevision: storeRevision,
-            tokenByPair: tokenByPair,
-            delegationByPair: delegationByPair
+            tokenByPair: tokenByPair
         )
     }
 
@@ -537,7 +478,6 @@ actor AgentSessionOversightIntentStore {
         replacement[pair] = mintToken(for: pair, revision: storeRevision &+ 1)
         var receipt = commit(
             pairs: Set(replacement.keys),
-            delegations: delegationByPair,
             revisionBefore: storeRevision,
             transitions: [.init(pair: pair, before: nil, after: replacement[pair])],
             apply: { [self] in
@@ -611,78 +551,14 @@ actor AgentSessionOversightIntentStore {
         }
         var remaining = tokenByPair
         remaining.removeValue(forKey: pair)
-        var remainingDelegations = delegationByPair
-        remainingDelegations.removeValue(forKey: pair)
         return commit(
             pairs: Set(remaining.keys),
-            delegations: remainingDelegations,
             revisionBefore: storeRevision,
             transitions: [.init(pair: pair, before: current, after: nil)],
             apply: { [self] in
                 tokenByPair = remaining
-                delegationByPair = remainingDelegations
             }
         )
-    }
-
-    /// Records one field of the user's delegation for one present pair.
-    ///
-    /// Only an explicit user toggle on a live link calls this. A pair that is not saved reports
-    /// `.absent` and writes nothing — delegation never creates a relationship on its own — and an
-    /// identical value is `.unchanged`. The pair's token and assertion generation are untouched: this
-    /// is an attribute of the current intent, not a new assertion of it. Fields left `nil` keep their
-    /// saved value; the merge happens inside the actor so two concurrent toggles cannot lose each
-    /// other's write.
-    func setDelegation(
-        for pair: AgentSessionOversightIntent,
-        manage: Bool? = nil,
-        autoApprovePermissions: Bool? = nil
-    ) -> AgentSessionOversightIntentMutationReceipt {
-        var delegation = delegationByPair[pair] ?? .none
-        if let manage { delegation.manage = manage }
-        if let autoApprovePermissions { delegation.autoApprovePermissions = autoApprovePermissions }
-        return logged("set_delegation", performSetDelegation(delegation, for: pair))
-    }
-
-    private func performSetDelegation(
-        _ delegation: AgentSessionOversightDelegation,
-        for pair: AgentSessionOversightIntent
-    ) -> AgentSessionOversightIntentMutationReceipt {
-        guard mutationIsAdmitted else { return blockedReceipt() }
-        guard let token = tokenByPair[pair] else {
-            return AgentSessionOversightIntentMutationReceipt(
-                outcome: .absent,
-                storeRevisionBefore: storeRevision,
-                storeRevisionAfter: storeRevision,
-                transitions: [],
-                wroteFile: false
-            )
-        }
-        guard (delegationByPair[pair] ?? .none) != delegation else {
-            return AgentSessionOversightIntentMutationReceipt(
-                outcome: .unchanged,
-                storeRevisionBefore: storeRevision,
-                storeRevisionAfter: storeRevision,
-                transitions: [.init(pair: pair, before: token, after: token)],
-                wroteFile: false
-            )
-        }
-        var updated = delegationByPair
-        updated[pair] = delegation.isEmpty ? nil : delegation
-        return commit(
-            pairs: Set(tokenByPair.keys),
-            delegations: updated,
-            revisionBefore: storeRevision,
-            transitions: [.init(pair: pair, before: token, after: token)],
-            apply: { [self] in
-                delegationByPair = updated
-            }
-        )
-    }
-
-    /// The saved delegation for one pair, or `.none` when the pair has none or is not saved.
-    func delegation(for pair: AgentSessionOversightIntent) -> AgentSessionOversightDelegation {
-        delegationByPair[pair] ?? .none
     }
 
     /// Removes every intent touching one session. Used only when the session itself is known to be
@@ -725,23 +601,19 @@ actor AgentSessionOversightIntentStore {
             )
         }
         var remaining = tokenByPair
-        var remainingDelegations = delegationByPair
         for pair in matches.keys {
             remaining.removeValue(forKey: pair)
-            remainingDelegations.removeValue(forKey: pair)
         }
         let transitions = matches
             .map { AgentSessionOversightIntentTokenTransition(pair: $0.key, before: $0.value, after: nil) }
             .sorted { AgentSessionOversightIntent.canonicallyOrdered($0.pair, $1.pair) }
         return commit(
             pairs: Set(remaining.keys),
-            delegations: remainingDelegations,
             revisionBefore: storeRevision,
             transitions: transitions,
             attemptedCurrentByPair: attempted,
             apply: { [self] in
                 tokenByPair = remaining
-                delegationByPair = remainingDelegations
             }
         )
     }
@@ -775,7 +647,7 @@ actor AgentSessionOversightIntentStore {
         _ receipt: AgentSessionOversightIntentMutationReceipt
     ) -> AgentSessionOversightIntentMutationReceipt {
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.store.receipt",
                 fields: [
                     "op": operation,
@@ -799,14 +671,14 @@ actor AgentSessionOversightIntentStore {
             didLogLaunchClassification = true
             switch result {
             case .suppressed:
-                WorkspaceRestorePerfLog.event("oversight.store.load", fields: ["result": "suppressed"])
+                restorePerfRecorder.event("oversight.store.load", fields: ["result": "suppressed"])
             case let .blocked(reason):
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "oversight.store.load",
                     fields: ["result": "blocked", "reason": reason.diagnosticLabel]
                 )
             case let .ready(load):
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "oversight.store.load",
                     fields: ["result": load.source.rawValue, "pairs": String(load.tokenByPair.count)]
                 )
@@ -841,7 +713,6 @@ actor AgentSessionOversightIntentStore {
     ///   blocked or fails, so committed-deletion cleanup can queue exact retries without another hop.
     private func commit(
         pairs: Set<AgentSessionOversightIntent>,
-        delegations: [AgentSessionOversightIntent: AgentSessionOversightDelegation],
         revisionBefore: UInt64,
         transitions: [AgentSessionOversightIntentTokenTransition],
         attemptedCurrentByPair: [AgentSessionOversightIntent: AgentSessionOversightIntentCurrentAttempt] = [:],
@@ -854,21 +725,8 @@ actor AgentSessionOversightIntentStore {
         guard pairs.count <= maxDecodedRowCount else {
             return blockedReceipt(attemptedCurrentByPair: attemptedCurrentByPair)
         }
-        let delegationRecords = delegations
-            .filter { pairs.contains($0.key) && !$0.value.isEmpty }
-            .sorted { AgentSessionOversightIntent.canonicallyOrdered($0.key, $1.key) }
-            .map { pair, delegation in
-                AgentSessionOversightDelegationRecord(
-                    observerSessionID: pair.observerSessionID,
-                    targetSessionID: pair.targetSessionID,
-                    manage: delegation.manage ? true : nil,
-                    autoApprovePermissions: delegation.autoApprovePermissions ? true : nil
-                )
-            }
         let document = AgentSessionOversightIntentDocument(
-            links: pairs.sorted(by: AgentSessionOversightIntent.canonicallyOrdered),
-            // Omitted when empty so a document without delegation keeps the original format.
-            delegations: delegationRecords.isEmpty ? nil : delegationRecords
+            links: pairs.sorted(by: AgentSessionOversightIntent.canonicallyOrdered)
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

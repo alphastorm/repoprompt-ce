@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 
 #if DEBUG
     /// Debug-only root-load trace correlation for workspace restore metrics.

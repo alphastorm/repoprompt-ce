@@ -4,10 +4,39 @@ import SwiftUI
 
 // MARK: - Agent Session Row
 
+enum AgentSessionCreatorBadgeCopy {
+    static let iconName = "rectangle.connected.to.line.below"
+
+    static func tooltip(for creatorLabel: String) -> String {
+        "Created by \(creatorLabel)"
+    }
+}
+
+private struct AgentSessionCreatorBadge: View {
+    let creatorLabel: String
+    let onOpen: () -> Void
+
+    var body: some View {
+        let tooltip = AgentSessionCreatorBadgeCopy.tooltip(for: creatorLabel)
+        Button(action: onOpen) {
+            Image(systemName: AgentSessionCreatorBadgeCopy.iconName)
+                .font(.system(size: 11))
+                .foregroundStyle(.orange)
+                .frame(width: 16, height: 16)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .hoverTooltip(tooltip)
+        .accessibilityLabel(tooltip)
+    }
+}
+
 struct AgentSessionRow: View {
     let title: String
     let isActive: Bool
     var isOverseer = false
+    var createdByLabel: String?
+    var onOpenCreator: (() -> Void)?
     let isPinned: Bool
     let isMCPControlled: Bool
     let runState: AgentSessionRunState
@@ -659,6 +688,12 @@ struct AgentSessionRow: View {
                         overseerBadge
                     }
 
+                    if let creatorLabel = createdByLabel ?? sidebarOversightMenu?.createdByLabel {
+                        AgentSessionCreatorBadge(creatorLabel: creatorLabel) {
+                            onOpenCreator?()
+                        }
+                    }
+
                     if isPinned {
                         Image(systemName: "pin.fill")
                             .font(.system(size: pinFontSize))
@@ -1290,6 +1325,8 @@ struct AgentSessionRow: View {
 
 struct AgentStashedSessionRow: View {
     let stashed: StashedTab
+    var createdByLabel: String?
+    var onOpenCreator: (() -> Void)?
     var isSelected = false
     var showsSelectionPresentation = false
     var isInteractionEnabled = true
@@ -1416,6 +1453,11 @@ struct AgentStashedSessionRow: View {
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
                         .lineLimit(1)
                         .truncationMode(.tail)
+                    if let createdByLabel {
+                        AgentSessionCreatorBadge(creatorLabel: createdByLabel) {
+                            onOpenCreator?()
+                        }
+                    }
                     if stashed.tab.isPinned {
                         Image(systemName: "pin.fill")
                             .font(.system(size: pinIconSize))

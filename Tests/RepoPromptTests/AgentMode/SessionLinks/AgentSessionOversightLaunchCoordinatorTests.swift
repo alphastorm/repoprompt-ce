@@ -26,6 +26,13 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         var discovery: [AgentSessionLinkDiscoveryState] = []
         var topology: AgentSessionOversightRestoreTopologyState = .completeAllEntriesConsumed
         private(set) var publishedPresentations: [AgentSessionOversightPersistencePresentation] = []
+        var laneCreatorByEndpoint: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
+        private(set) var providerTaskRequests = 0
+
+        func agentSessionLinkLaneProvenance(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> UUID? {
+            laneCreatorByEndpoint[endpoint]
+        }
+
         private(set) var hydrationRequests: [Set<UUID>] = []
 
         func agentSessionLinkRequestRestorationHydration(sessionIDs: Set<UUID>) {
@@ -63,6 +70,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
                 displayName: candidate.displayName,
                 providerDisplayName: candidate.providerDisplayName,
                 status: .idle,
+                board: .empty,
                 idleForSend: true,
                 pendingInteractionKind: nil,
                 latestVisibleAssistantPreview: nil,
@@ -135,7 +143,17 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             liveness _: @escaping AgentSessionLinkSendLivenessProbe,
             commitAuthorization _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
         ) async -> AgentSessionLinkSendTransactionOutcome {
-            .blocked(.shuttingDown)
+            providerTaskRequests += 1
+            return .blocked(.shuttingDown)
+        }
+
+        func agentSessionLinkPerformCompact(
+            to _: AgentSessionLinkEndpointCandidate,
+            request _: AgentSessionLinkCompactRequest,
+            liveness _: @escaping AgentSessionLinkSendLivenessProbe,
+            commitAuthorization _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkSendTransactionOutcome {
+            .blocked(.endpointInvalidated)
         }
     }
 
@@ -185,16 +203,8 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     }
 
     /// Seeds the durable manifest so the launch load produces exactly this one saved pair.
-    private func seedSavedPair(delegation: AgentSessionOversightDelegation = .none) throws {
-        let delegations: [AgentSessionOversightDelegationRecord]? = delegation.isEmpty ? nil : [
-            AgentSessionOversightDelegationRecord(
-                observerSessionID: observerSessionID,
-                targetSessionID: targetSessionID,
-                manage: delegation.manage,
-                autoApprovePermissions: delegation.autoApprovePermissions
-            )
-        ]
-        let document = AgentSessionOversightIntentDocument(links: [pair], delegations: delegations)
+    private func seedSavedPair() throws {
+        let document = AgentSessionOversightIntentDocument(links: [pair])
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         try encoder.encode(document).write(
@@ -307,6 +317,28 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
 
     // MARK: - Barriers
 
+    func testCreatorLaneRestoresAsOrdinaryManagedLinkWithoutStartingAProviderTask() async throws {
+        try seedSavedPair()
+        let originalFile = try Data(contentsOf: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename))
+        let fixture = makeFixture()
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        let lane = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        fixture.host.candidates = [observer, lane]
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: lane)]
+        fixture.host.laneCreatorByEndpoint[lane.domainEndpoint] = observerSessionID
+
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+
+        let inventory = await fixture.authority.links(forObserverEndpoint: observer.domainEndpoint)
+        XCTAssertEqual(inventory.items.map(\.targetSessionID), [targetSessionID])
+        XCTAssertEqual(inventory.items.first?.capabilities, DomainAgentSessionLinkCapability.managed)
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
+        XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 1)
+        XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+        XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename)), originalFile)
+    }
+
     func testNothingIsReservedWhileTheRestoreTopologyIsStillPending() async throws {
         try seedSavedPair()
         let fixture = makeFixture()
@@ -394,6 +426,14 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
 
         restored = await isRestored(fixture)
         XCTAssertTrue(restored)
+        let restoredInventory = await fixture.authority.links(forObserverEndpoint: observer.domainEndpoint)
+        XCTAssertEqual(restoredInventory.items.first?.capabilities, DomainAgentSessionLinkCapability.managed)
+        let managedLease = try await fixture.authority.authorize(
+            operation: .monitorRespond,
+            observerEndpoint: observer.domainEndpoint,
+            targetSessionID: target.sessionID
+        ).get()
+        XCTAssertEqual(managedLease.capability, .manage, "restoration follows the same managed Add path")
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
         XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 1)
     }
@@ -417,126 +457,6 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(fixture.host.hydrationRequests, [[targetSessionID]])
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
-    }
-
-    // MARK: - Saved delegation
-
-    private func restoredInventoryItem(_ fixture: Fixture) async -> DomainAgentSessionLinkInventoryItem? {
-        let inventory = await fixture.authority.links(forObserver: observerSessionID)
-        return inventory.items.first { $0.targetSessionID == targetSessionID }
-    }
-
-    /// The user's report: after relaunch the links came back watch-only and management / permission
-    /// auto-approval had to be granted again. A saved delegation is re-applied to the restored grant.
-    func testARestoredLinkRegainsItsSavedManagementAndAutoApproval() async throws {
-        try seedSavedPair(delegation: AgentSessionOversightDelegation(manage: true, autoApprovePermissions: true))
-        let fixture = makeFixture()
-        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
-        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
-        fixture.host.candidates = [observer, target]
-        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
-
-        await fixture.bridge.bootstrapIntentStore(fixture.store)
-        await fixture.bridge.test_settleLaunchReconciliation()
-
-        let item = await restoredInventoryItem(fixture)
-        XCTAssertEqual(item?.capabilities.contains(.manage), true, "Management must survive relaunch.")
-        XCTAssertTrue(fixture.bridge.hasAutoApprovalSelection(for: target.domainEndpoint))
-        let authorized = await fixture.bridge.autoApprovalIsAuthorized(for: target.domainEndpoint)
-        XCTAssertTrue(authorized, "Auto-approval must be re-applied to the exact restored grant.")
-    }
-
-    func testARestoredLinkWithoutSavedDelegationStaysWatchOnly() async throws {
-        try seedSavedPair()
-        let fixture = makeFixture()
-        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
-        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
-        fixture.host.candidates = [observer, target]
-        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
-
-        await fixture.bridge.bootstrapIntentStore(fixture.store)
-        await fixture.bridge.test_settleLaunchReconciliation()
-
-        let item = await restoredInventoryItem(fixture)
-        XCTAssertNotNil(item)
-        XCTAssertEqual(item?.capabilities.contains(.manage), false)
-        XCTAssertFalse(fixture.bridge.hasAutoApprovalSelection(for: target.domainEndpoint))
-    }
-
-    /// A user who re-adds a still-saved pair before automatic restore ran gets its delegation back
-    /// rather than a watch-only link they have to re-grant by hand.
-    func testAnExplicitAddOfAStillSavedPairReappliesItsDelegation() async throws {
-        try seedSavedPair(delegation: AgentSessionOversightDelegation(manage: true, autoApprovePermissions: false))
-        let fixture = makeFixture()
-        fixture.host.topology = .pending
-        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
-        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
-        fixture.host.candidates = [observer, target]
-        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
-
-        await fixture.bridge.bootstrapIntentStore(fixture.store)
-        await fixture.bridge.test_settleLaunchReconciliation()
-        XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 0)
-
-        let outcome = await fixture.bridge.addMonitorLink(pair: pair)
-        guard case .added = outcome else { return XCTFail("Expected the Add to create a grant, got \(outcome)") }
-
-        let item = await restoredInventoryItem(fixture)
-        XCTAssertEqual(item?.capabilities.contains(.manage), true)
-        XCTAssertFalse(fixture.bridge.hasAutoApprovalSelection(for: target.domainEndpoint))
-    }
-
-    /// Toggles are recorded on the saved pair, and Stop removes the pair together with its delegation
-    /// so a later re-add starts watch-only.
-    func testDelegationTogglesPersistAndStopDropsThem() async throws {
-        try seedSavedPair()
-        let fixture = makeFixture()
-        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
-        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
-        fixture.host.candidates = [observer, target]
-        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
-
-        await fixture.bridge.bootstrapIntentStore(fixture.store)
-        await fixture.bridge.test_settleLaunchReconciliation()
-        let restoredItem = await restoredInventoryItem(fixture)
-        let item = try XCTUnwrap(restoredItem)
-        let reference = DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
-
-        let managed = await fixture.bridge.setManagement(
-            true,
-            observerEndpoint: observer.domainEndpoint,
-            targetEndpoint: target.domainEndpoint,
-            expectedReference: reference
-        )
-        XCTAssertTrue(managed)
-        let approved = await fixture.bridge.setAutoApproval(
-            true,
-            observerEndpoint: observer.domainEndpoint,
-            targetEndpoint: target.domainEndpoint,
-            expectedReference: reference
-        )
-        XCTAssertTrue(approved)
-        var saved = await fixture.store.delegation(for: pair)
-        XCTAssertEqual(saved, AgentSessionOversightDelegation(manage: true, autoApprovePermissions: true))
-
-        _ = await fixture.bridge.setManagement(
-            false,
-            observerEndpoint: observer.domainEndpoint,
-            targetEndpoint: target.domainEndpoint,
-            expectedReference: reference
-        )
-        saved = await fixture.store.delegation(for: pair)
-        XCTAssertEqual(saved, AgentSessionOversightDelegation(manage: false, autoApprovePermissions: true))
-
-        _ = await fixture.bridge.stopMonitorLink(
-            observerEndpoint: observer.domainEndpoint,
-            targetEndpoint: target.domainEndpoint,
-            expectedReference: reference
-        )
-        let tokenAfterStop = await fixture.store.token(for: pair)
-        XCTAssertNil(tokenAfterStop)
-        saved = await fixture.store.delegation(for: pair)
-        XCTAssertEqual(saved, .none, "Stop ends the relationship and its delegation together.")
     }
 
     func testInProgressDeletionKeepsLaunchIntentWaitingAndFailureRestoresIt() async throws {

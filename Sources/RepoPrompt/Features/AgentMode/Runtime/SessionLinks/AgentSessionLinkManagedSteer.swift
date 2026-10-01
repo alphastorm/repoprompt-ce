@@ -14,8 +14,8 @@ import RepoPromptDomainRuntime
 /// Provider route one managed steer takes, classified before the attributed row exists.
 ///
 /// Deliberately short. An idle target is not a route: it goes through the durable send transaction.
-/// ACP live steering and the shared follow-up queue are not routes: both can hand the steer's text
-/// back to the target user's composer on their recovery paths.
+/// The ACP route is a managed-aware serialized queue; only local draft text is recoverable into
+/// the target user's composer.
 enum AgentSessionLinkManagedSteerRoute: Equatable {
     /// Codex native steer, or its durable fallback queue. The outcome comes from the steer
     /// acknowledgement tracker.
@@ -24,6 +24,8 @@ enum AgentSessionLinkManagedSteerRoute: Equatable {
     case waitingInstruction
     /// The Claude-native interrupt-steering queue.
     case claudeInterrupt
+    /// The serialized ACP interrupt, settle, and prompt queue.
+    case acpQueued
 }
 
 /// Provider-level outcome of one managed steer after its attributed row was appended.
@@ -137,7 +139,8 @@ extension AgentSessionLinkSteerAdmission {
             // only idle path, so wait for it rather than racing it.
             return .blocked(.targetBusy)
         }
-        if readiness.terminalCommitInProgress
+        if readiness.stopInProgress
+            || readiness.terminalCommitInProgress
             || readiness.isComposerSubmissionInFlight
             || readiness.isPreparingInitialWorktree
             || readiness.isChangingExecutionLocation
